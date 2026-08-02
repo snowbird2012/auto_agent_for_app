@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 
-from PySide6.QtCore import QTime, Qt, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -33,24 +32,31 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTextEdit,
-    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from storage.settings_repository import SettingsRepository
+from storage.task_repository import TaskRepository
+from storage.user_repository import UserRepository
+from devices import ADBClient, AndroidDevice
 from ui.ai_settings_widget import AISettingsWidget
+from ui.device_management_widget import DeviceManagementWidget
 from ui.proxy_settings_widget import ProxySettingsWidget
+from ui.task_center_widget import TaskCenterWidget
+from ui.user_management_widget import UserManagementWidget
 from ui.widgets import DeviceStatusCard, MetricCard, MiniChart, SectionHeader, card_layout, label
+from utils.time_utils import COMMON_TIMEZONES
 
 
 NAV_ITEMS = [
-    ("OV", "运营总览"),
-    ("DV", "设备管理"),
-    ("TK", "任务中心"),
-    ("CT", "联系人"),
-    ("RV", "审核中心"),
-    ("ST", "系统设置"),
+    "运营总览",
+    "设备管理",
+    "任务中心",
+    "用户管理",
+    "联系人",
+    "审核中心",
+    "系统设置",
 ]
 
 NOTIFICATION_SETTINGS_ENABLED = False
@@ -60,7 +66,10 @@ class MainWindow(QMainWindow):
     def __init__(self, settings_repository: SettingsRepository | None = None) -> None:
         super().__init__()
         self.settings_repository = settings_repository or SettingsRepository()
-        self.setWindowTitle("AutoAgent · Android 智能运营中心")
+        self.task_repository = TaskRepository(self.settings_repository.database_path)
+        self.user_repository = UserRepository(self.settings_repository.database_path)
+        self.adb_client = ADBClient()
+        self.setWindowTitle("AutoAgent · Android")
         self.resize(1480, 900)
         self.setMinimumSize(1180, 720)
         self.nav_buttons: list[QPushButton] = []
@@ -84,8 +93,19 @@ class MainWindow(QMainWindow):
 
         self.pages = QStackedWidget()
         self.pages.addWidget(self._scroll_page(self._dashboard_page()))
-        self.pages.addWidget(self._scroll_page(self._devices_page()))
-        self.pages.addWidget(self._scroll_page(self._tasks_page()))
+        self.device_page = DeviceManagementWidget(self.adb_client)
+        self.device_page.devices_updated.connect(self._update_dashboard_devices)
+        self.pages.addWidget(self._scroll_page(self.device_page))
+        self.task_page = TaskCenterWidget(
+            self.adb_client, self.task_repository, self.user_repository
+        )
+        self.device_page.devices_updated.connect(self.task_page.update_devices)
+        self.pages.addWidget(self._scroll_page(self.task_page))
+        self.user_page = UserManagementWidget(
+            self.user_repository, self.settings_repository
+        )
+        self.task_page.users_updated.connect(self.user_page.refresh_users)
+        self.pages.addWidget(self._scroll_page(self.user_page))
         self.pages.addWidget(self._contacts_page())
         self.pages.addWidget(self._scroll_page(self._review_page()))
         self.pages.addWidget(self._scroll_page(self._settings_page()))
@@ -113,8 +133,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
         layout.addSpacing(22)
 
-        for index, (icon, title) in enumerate(NAV_ITEMS):
-            button = QPushButton(f"{icon}    {title}")
+        for index, title in enumerate(NAV_ITEMS):
+            button = QPushButton(title)
             button.setObjectName("NavButton")
             button.setCheckable(True)
             button.clicked.connect(partial(self._switch_page, index))
@@ -131,7 +151,8 @@ class MainWindow(QMainWindow):
         online.addWidget(label("服务运行正常"))
         online.addStretch()
         status_layout.addLayout(online)
-        status_layout.addWidget(label("3 台设备在线 · 模拟数据", "Small"))
+        self.sidebar_device_status = label("ADB 尚未扫描", "Small")
+        status_layout.addWidget(self.sidebar_device_status)
         layout.addWidget(status)
         return sidebar
 
@@ -150,7 +171,7 @@ class MainWindow(QMainWindow):
         search.setFixedWidth(270)
         layout.addWidget(search)
         notice = QPushButton("●  3 条待处理")
-        notice.clicked.connect(lambda: self._switch_page(4))
+        notice.clicked.connect(lambda: self._switch_page(5))
         layout.addWidget(notice)
         avatar = QLabel("管")
         avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -163,7 +184,7 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
-        self.breadcrumb.setText(f"工作台  /  {NAV_ITEMS[index][1]}")
+        self.breadcrumb.setText(f"工作台  /  {NAV_ITEMS[index]}")
 
     @staticmethod
     def _scroll_page(content: QWidget) -> QScrollArea:
@@ -200,13 +221,16 @@ class MainWindow(QMainWindow):
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(14)
         metric_data = [
-            ("在线设备", "3 / 4", "比昨日增加 1 台", "blue"),
+            ("在线设备", "—", "等待 ADB 扫描", "blue"),
             ("今日发现用户", "186", "↑ 12.4% 较昨日", "green"),
             ("今日新增关注", "42", "任务额度剩余 58", "orange"),
             ("待处理会话", "8", "3 条需要人工审核", "pink"),
         ]
         for index, values in enumerate(metric_data):
-            metrics.addWidget(MetricCard(*values), 0, index)
+            card = MetricCard(*values)
+            if index == 0:
+                self.dashboard_device_metric = card
+            metrics.addWidget(card, 0, index)
         layout.addLayout(metrics)
 
         middle = QHBoxLayout()
@@ -228,10 +252,7 @@ class MainWindow(QMainWindow):
         activity, activity_layout = card_layout()
         activity_layout.addWidget(label("实时动态", "SectionTitle"))
         events = [
-            ("●", "Pixel 7", "发现高意向用户 @maya_design", "刚刚", "#34d399"),
-            ("●", "Galaxy S22", "发送首条消息成功", "2 分钟前", "#3b82f6"),
-            ("●", "Xiaomi 13", "收到一条新私信", "6 分钟前", "#f59e0b"),
-            ("●", "AI 分析", "1 条会话转入人工审核", "11 分钟前", "#f472b6"),
+            ("●", "系统", "等待真实任务事件", "设备连接后开始记录", "#3b82f6"),
         ]
         for icon, source, text, when, color in events:
             row = QHBoxLayout()
@@ -249,156 +270,32 @@ class MainWindow(QMainWindow):
         layout.addLayout(middle)
 
         layout.addWidget(label("设备运行状态", "SectionTitle"))
-        device_grid = QGridLayout()
-        device_grid.setHorizontalSpacing(14)
-        device_grid.addWidget(DeviceStatusCard("Pixel 7", "Android 15 · A01", "运行中", "TikTok · 搜索：露营装备", 68), 0, 0)
-        device_grid.addWidget(DeviceStatusCard("Galaxy S22", "Android 14 · A02", "运行中", "TikTok · 处理未读私信", 41), 0, 1)
-        device_grid.addWidget(DeviceStatusCard("Xiaomi 13", "Android 15 · A03", "空闲", "等待下一个计划任务", 0), 0, 2)
-        layout.addLayout(device_grid)
+        self.dashboard_device_grid = QGridLayout()
+        self.dashboard_device_grid.setHorizontalSpacing(14)
+        self.dashboard_device_grid.addWidget(label("正在读取 ADB 设备…", "Muted"), 0, 0)
+        layout.addLayout(self.dashboard_device_grid)
         layout.addStretch()
         return page
 
-    def _devices_page(self) -> QWidget:
-        page, layout = self._page()
-        row = QHBoxLayout()
-        row.addWidget(SectionHeader("设备管理", "连接、监控并分配 Android 设备"))
-        row.addStretch()
-        scan = QPushButton("扫描 USB 设备")
-        scan.clicked.connect(lambda: self._info("设备扫描", "UI 原型暂未连接 ADB，已保留扫描入口。"))
-        scan.setObjectName("Primary")
-        row.addWidget(scan)
-        layout.addLayout(row)
-
-        summary, summary_layout = card_layout()
-        sr = QHBoxLayout()
-        for value, text, color in [("4", "设备总数", "#7db4ff"), ("3", "在线", "#54e0ac"), ("2", "运行中", "#f5c46f"), ("1", "离线", "#ff8fa0")]:
-            block = QVBoxLayout()
-            value_label = label(value, "Metric")
-            value_label.setStyleSheet(f"color:{color}; font-size:25px; font-weight:700;")
-            block.addWidget(value_label)
-            block.addWidget(label(text, "Muted"))
-            sr.addLayout(block)
-            sr.addStretch()
-        summary_layout.addLayout(sr)
-        layout.addWidget(summary)
-
-        table = self._table(["设备", "ADB 序列号", "系统", "绑定账号", "当前任务", "状态", "操作"])
-        rows = [
-            ["Pixel 7", "32051FDH2009B", "Android 15", "@north_lab", "搜索：露营装备", "运行中", "查看"],
-            ["Galaxy S22", "R5CT31A8", "Android 14", "@daily_home", "处理未读私信", "运行中", "查看"],
-            ["Xiaomi 13", "84e3c901", "Android 15", "@light_studio", "—", "空闲", "查看"],
-            ["OnePlus 10", "8A15F0C2", "Android 13", "未绑定", "—", "离线", "诊断"],
-        ]
-        self._fill_table(table, rows)
-        table.setMinimumHeight(300)
-        layout.addWidget(table)
-
-        detail, detail_layout = card_layout()
-        detail_layout.addWidget(label("设备预览 · Pixel 7", "SectionTitle"))
-        details = QHBoxLayout()
-        mock = QLabel("TikTok\n\n设备画面预览\n\n1080 × 2400")
-        mock.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mock.setFixedSize(180, 330)
-        mock.setStyleSheet("background:#050a12; border:5px solid #24334a; border-radius:24px; color:#50627a;")
-        details.addWidget(mock)
-        info = QVBoxLayout()
-        for title, value in [("连接状态", "在线 · USB"), ("电量", "82%"), ("前台应用", "com.zhiliaoapp.musically"), ("分辨率", "1080 × 2400"), ("最近心跳", "刚刚")]:
-            r = QHBoxLayout()
-            r.addWidget(label(title, "Muted"))
-            r.addStretch()
-            r.addWidget(label(value))
-            info.addLayout(r)
-        info.addStretch()
-        actions = QHBoxLayout()
-        actions.addWidget(QPushButton("暂停任务"))
-        actions.addWidget(QPushButton("人工接管"))
-        actions.addWidget(QPushButton("重启应用"))
-        actions.addStretch()
-        info.addLayout(actions)
-        details.addLayout(info, 1)
-        detail_layout.addLayout(details)
-        layout.addWidget(detail)
-        return page
-
-    def _tasks_page(self) -> QWidget:
-        page, layout = self._page()
-        row = QHBoxLayout()
-        row.addWidget(SectionHeader("任务中心", "创建 TikTok 采集任务并安排执行时间"))
-        row.addStretch()
-        new_button = QPushButton("+  新建任务")
-        new_button.setObjectName("Primary")
-        new_button.clicked.connect(lambda: self._info("新建任务", "右侧任务配置区域已准备好，可在后续版本接入持久化。"))
-        row.addWidget(new_button)
-        layout.addLayout(row)
-
-        splitter = QSplitter()
-        active, active_layout = card_layout()
-        active_layout.addWidget(label("正在执行", "SectionTitle"))
-        for name, device, keyword, progress in [
-            ("户外兴趣用户发现", "Pixel 7", "露营装备", 68),
-            ("私信自动回复", "Galaxy S22", "收件箱轮询", 41),
-        ]:
-            box, box_layout = card_layout(12)
-            top = QHBoxLayout()
-            top.addWidget(label(name, "SectionTitle"))
-            top.addStretch()
-            top.addWidget(label("运行中", "PillGreen"))
-            box_layout.addLayout(top)
-            box_layout.addWidget(label(f"{device}  ·  {keyword}", "Muted"))
-            bar = QProgressBar()
-            bar.setValue(progress)
-            box_layout.addWidget(bar)
-            controls = QHBoxLayout()
-            controls.addWidget(QPushButton("暂停"))
-            controls.addWidget(QPushButton("查看日志"))
-            controls.addStretch()
-            box_layout.addLayout(controls)
-            active_layout.addWidget(box)
-        active_layout.addStretch()
-        splitter.addWidget(active)
-
-        config, config_layout = card_layout()
-        config_layout.addWidget(label("TikTok 任务配置", "SectionTitle"))
-        form = QFormLayout()
-        form.setSpacing(12)
-        task_name = QLineEdit("户外兴趣用户发现")
-        app = QComboBox(); app.addItems(["TikTok", "其他应用（待扩展）"])
-        devices = QComboBox(); devices.addItems(["Pixel 7", "Galaxy S22", "所有空闲设备"])
-        keywords = QPlainTextEdit("露营装备\n户外旅行\n轻量帐篷")
-        keywords.setMaximumHeight(86)
-        start_time = QTimeEdit(QTime(9, 0)); start_time.setDisplayFormat("HH:mm")
-        end_time = QTimeEdit(QTime(20, 0)); end_time.setDisplayFormat("HH:mm")
-        time_row = QWidget(); time_layout = QHBoxLayout(time_row); time_layout.setContentsMargins(0, 0, 0, 0)
-        time_layout.addWidget(start_time); time_layout.addWidget(label("至", "Muted")); time_layout.addWidget(end_time)
-        max_comments = QSpinBox(); max_comments.setRange(10, 1000); max_comments.setValue(100)
-        form.addRow("任务名称", task_name)
-        form.addRow("目标应用", app)
-        form.addRow("执行设备", devices)
-        form.addRow("搜索关键词", keywords)
-        form.addRow("执行时段", time_row)
-        form.addRow("单词最大评论", max_comments)
-        config_layout.addLayout(form)
-        config_layout.addWidget(QCheckBox("允许关注符合条件的用户"))
-        config_layout.addWidget(QCheckBox("首条私信发送前需要人工审核"))
-        save = QPushButton("保存并创建任务")
-        save.setObjectName("Primary")
-        save.clicked.connect(lambda: self._info("任务已保存", "UI 原型已模拟保存任务，后续将接入数据库和调度器。"))
-        config_layout.addWidget(save)
-        config_layout.addStretch()
-        splitter.addWidget(config)
-        splitter.setSizes([560, 460])
-        layout.addWidget(splitter)
-
-        layout.addWidget(label("最近任务", "SectionTitle"))
-        table = self._table(["任务名称", "应用", "设备", "关键词", "发现用户", "开始时间", "状态"])
-        self._fill_table(table, [
-            ["美妆意向用户", "TikTok", "2 台", "summer makeup", "214", "昨天 14:20", "已完成"],
-            ["家居评论采集", "TikTok", "1 台", "small apartment", "87", "昨天 09:00", "已完成"],
-            ["周末补充任务", "TikTok", "1 台", "camping setup", "36", "周六 18:10", "已停止"],
-        ])
-        table.setMinimumHeight(220)
-        layout.addWidget(table)
-        return page
+    def _update_dashboard_devices(self, devices: list[AndroidDevice]) -> None:
+        while self.dashboard_device_grid.count():
+            item = self.dashboard_device_grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        online = [device for device in devices if device.authorized]
+        self.dashboard_device_metric.set_value(f"{len(online)} / {len(devices)}")
+        self.sidebar_device_status.setText(f"{len(online)} 台设备在线 · ADB 实时数据")
+        if not devices:
+            self.dashboard_device_grid.addWidget(label("未发现 Android 设备，请检查 USB 连接和调试授权。", "Muted"), 0, 0)
+            return
+        for index, device in enumerate(devices[:3]):
+            status = "已连接" if device.authorized else ("未授权" if device.state == "unauthorized" else "离线")
+            system = f"Android {device.android_version or '未知'} · {device.connection_type}"
+            foreground = device.foreground_package or ("等待 USB 调试授权" if not device.authorized else "ADB 已连接")
+            progress = device.battery_level or 0
+            self.dashboard_device_grid.addWidget(
+                DeviceStatusCard(device.display_name, system, status, foreground, progress), 0, index
+            )
 
     def _contacts_page(self) -> QWidget:
         page, layout = self._page()
@@ -518,12 +415,52 @@ class MainWindow(QMainWindow):
         page, layout = self._page()
         layout.addWidget(SectionHeader("系统设置", "配置多个 API 厂家、模型类型、自动化边界和消息推送"))
         tabs = QTabWidget()
+        tabs.addTab(self._basic_settings(), "基本设置")
         tabs.addTab(AISettingsWidget(self.settings_repository), "AI 模型服务")
         tabs.addTab(ProxySettingsWidget(self.settings_repository), "网络代理")
         tabs.addTab(self._automation_settings(), "自动化规则")
         if NOTIFICATION_SETTINGS_ENABLED:
             tabs.addTab(self._notification_settings(), "消息推送")
         layout.addWidget(tabs)
+        return page
+
+    def _basic_settings(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 16, 0, 0)
+        card, content = card_layout()
+        content.addWidget(label("区域与时间", "SectionTitle"))
+        content.addWidget(label(
+            "数据库时间统一按 UTC 保存，界面中的列表时间按此时区显示。",
+            "Muted",
+        ))
+        form = QFormLayout()
+        form.setSpacing(13)
+        timezone_combo = QComboBox()
+        timezone_combo.setEditable(True)
+        timezone_combo.addItems(list(COMMON_TIMEZONES))
+        timezone_combo.setCurrentText(self.settings_repository.get_timezone())
+        form.addRow("显示时区", timezone_combo)
+        content.addLayout(form)
+        save = QPushButton("保存基本设置")
+        save.setObjectName("Primary")
+
+        def save_basic_settings() -> None:
+            try:
+                timezone_name = self.settings_repository.save_timezone(
+                    timezone_combo.currentText()
+                )
+            except ValueError as error:
+                QMessageBox.warning(self, "时区无效", str(error))
+                return
+            timezone_combo.setCurrentText(timezone_name)
+            self.user_page.refresh_users()
+            self._info("保存成功", f"列表显示时区已设置为 {timezone_name}。")
+
+        save.clicked.connect(save_basic_settings)
+        content.addWidget(save)
+        layout.addWidget(card)
+        layout.addStretch()
         return page
 
     def _llm_settings(self) -> QWidget:
@@ -627,3 +564,12 @@ class MainWindow(QMainWindow):
 
     def _info(self, title: str, text: str) -> None:
         QMessageBox.information(self, title, text)
+
+    def closeEvent(self, event) -> None:
+        self.task_page.shutdown()
+        self.user_page.shutdown()
+        for worker in list(self.task_page.workers.values()):
+            worker.wait(3_000)
+        if self.user_page.intent_worker:
+            self.user_page.intent_worker.wait(3_000)
+        super().closeEvent(event)

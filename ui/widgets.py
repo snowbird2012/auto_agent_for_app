@@ -44,10 +44,14 @@ class MetricCard(QFrame):
         dot.setStyleSheet(f"color:{accent}; background:{bg}; border-radius:10px; padding:1px 6px;")
         top.addWidget(dot)
         outer.addLayout(top)
-        outer.addWidget(label(value, "Metric"))
+        self.value_label = label(value, "Metric")
+        outer.addWidget(self.value_label)
         hint = label(note, "Small")
         hint.setStyleSheet(f"color:{accent};")
         outer.addWidget(hint)
+
+    def set_value(self, value: str) -> None:
+        self.value_label.setText(value)
 
 
 class SectionHeader(QWidget):

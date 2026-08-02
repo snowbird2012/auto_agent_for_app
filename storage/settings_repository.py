@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from storage.secret_store import protect_secret, unprotect_secret
+from utils.time_utils import DEFAULT_TIMEZONE, normalize_timezone
 
 
 MODEL_TYPES = ("llm", "embedding", "rerank", "vision")
@@ -20,6 +21,8 @@ class SettingsRepository:
         self.database_path = Path(database_path) if database_path else project_root / "data" / "autoagent.db"
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        if self.get_setting("timezone") is None:
+            self.set_setting("timezone", DEFAULT_TIMEZONE)
         if seed:
             self._seed_defaults()
 
@@ -268,6 +271,18 @@ class SettingsRepository:
                 ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,
                 updated_at=CURRENT_TIMESTAMP""", (key, encoded),
             )
+
+    def get_timezone(self) -> str:
+        value = self.get_setting("timezone", DEFAULT_TIMEZONE)
+        try:
+            return normalize_timezone(str(value))
+        except ValueError:
+            return DEFAULT_TIMEZONE
+
+    def save_timezone(self, timezone_name: str) -> str:
+        normalized = normalize_timezone(timezone_name)
+        self.set_setting("timezone", normalized)
+        return normalized
 
     def get_proxy_settings(self, reveal_password: bool = False) -> dict[str, Any]:
         defaults = {

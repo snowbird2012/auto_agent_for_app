@@ -1,0 +1,751 @@
+"""TikTok search-to-chat state machine, validated against a real device UI."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from threading import Event
+from time import monotonic, sleep
+from typing import Callable
+import xml.etree.ElementTree as ET
+
+import cv2
+import uiautomator2 as u2
+
+from devices import ADBClient
+
+
+class WorkflowError(RuntimeError):
+    pass
+
+
+class WorkflowCancelled(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class UINode:
+    text: str
+    description: str
+    resource_id: str
+    class_name: str
+    clickable: bool
+    selected: bool
+    bounds: tuple[int, int, int, int]
+    container_key: str = ""
+
+    @property
+    def center(self) -> tuple[int, int]:
+        left, top, right, bottom = self.bounds
+        return ((left + right) // 2, (top + bottom) // 2)
+
+    @property
+    def area(self) -> int:
+        left, top, right, bottom = self.bounds
+        return max(0, right - left) * max(0, bottom - top)
+
+
+@dataclass(slots=True)
+class CommentEntry:
+    username: str
+    comment: str
+    title_node: UINode
+
+
+@dataclass(slots=True)
+class ProfileInfo:
+    handle: str = ""
+    following: str = "未知"
+    followers: str = "未知"
+    likes: str = "未知"
+
+
+ProgressCallback = Callable[[str, str, int], None]
+UserCallback = Callable[[dict[str, str]], None]
+
+
+class TikTokSearchWorkflow:
+    def __init__(self, adb: ADBClient, serial: str, package: str = "com.zhiliaoapp.musically", evidence_root: str | Path | None = None) -> None:
+        self.adb = adb
+        self.serial = serial
+        self.package = package
+        self.device = None
+        self.cancel_event = Event()
+        root = Path(__file__).resolve().parents[1]
+        self.evidence_root = Path(evidence_root) if evidence_root else root / "data" / "evidence" / "tasks"
+
+    def cancel(self) -> None:
+        self.cancel_event.set()
+
+    def run(
+        self,
+        keyword: str,
+        content_type: str,
+        progress: ProgressCallback,
+        max_comments: int = 20,
+        collection_minutes: float = 2,
+        user_callback: UserCallback | None = None,
+    ) -> str:
+        keyword = keyword.strip()
+        if not keyword:
+            raise WorkflowError("搜索关键词不能为空")
+        if content_type not in {"video", "live", "either"}:
+            raise WorkflowError("内容类型必须是 video、live 或 either")
+        try:
+            self._emit(progress, "START_APP", "正在启动 TikTok", 8)
+            self.adb.force_stop_app(self.serial, self.package)
+            self.adb.start_app(self.serial, self.package)
+            self.device = u2.connect(self.serial)
+            self._wait_package(12)
+
+            self._emit(progress, "OPEN_SEARCH", "正在定位搜索入口", 18)
+            self._open_search()
+
+            self._emit(progress, "ENTER_KEYWORD", f"正在输入关键词：{keyword}", 32)
+            self._enter_keyword(keyword)
+
+            self._emit(progress, "WAIT_RESULTS", "等待搜索结果加载", 48)
+            self._wait_search_results(15)
+
+            chosen_type = self._choose_category(content_type)
+            if chosen_type == "video":
+                self._collect_video_rooms(
+                    progress,
+                    max(1, min(200, int(max_comments))),
+                    max(0.1, min(1440.0, float(collection_minutes))),
+                    keyword,
+                    user_callback,
+                )
+            else:
+                self._emit(progress, "SELECT_CONTENT", "正在选择第一个直播结果", 65)
+                self._open_first_result(chosen_type)
+                self._emit(progress, "OPEN_CONTENT", "已进入直播，正在定位聊天入口", 82)
+                self._open_chat(chosen_type)
+                self._emit(progress, "CHAT_OPENED", "已进入直播聊天区域", 100)
+            return chosen_type
+        except WorkflowCancelled:
+            raise
+        except Exception as error:
+            evidence = self._save_evidence("failure")
+            suffix = f"；失败截图：{evidence}" if evidence else ""
+            if isinstance(error, WorkflowError):
+                raise WorkflowError(str(error) + suffix) from error
+            raise WorkflowError(f"自动化执行失败：{error}{suffix}") from error
+
+    def _emit(self, callback: ProgressCallback, step: str, message: str, percent: int) -> None:
+        self._check_cancelled()
+        callback(step, message, percent)
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise WorkflowCancelled("任务已由用户停止")
+
+    def _wait_package(self, timeout: float) -> None:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            self._check_cancelled()
+            current = self.device.app_current()
+            if current.get("package") == self.package:
+                return
+            sleep(0.4)
+        raise WorkflowError("TikTok 启动超时")
+
+    def _open_search(self) -> None:
+        # If TikTok was left on its search page, reuse it directly.
+        if self._find_node(class_name="android.widget.EditText", resource_suffix="/hgt"):
+            return
+        node = self._wait_node(lambda item: item.description == "搜索" and item.clickable, 10)
+        self.device.click(*node.center)
+        self._wait_node(lambda item: item.class_name == "android.widget.EditText", 10)
+
+    def _enter_keyword(self, keyword: str) -> None:
+        field = self.device(className="android.widget.EditText")
+        if not field.wait(timeout=8):
+            raise WorkflowError("未找到搜索输入框")
+        field.click()
+        field.set_text(keyword)
+        actual = field.get_text() or ""
+        if actual.strip() != keyword:
+            raise WorkflowError(f"关键词输入校验失败，期望“{keyword}”，实际“{actual}”")
+        submit = self.device(className="android.widget.Button", text="搜索")
+        if submit.exists:
+            submit.click()
+        else:
+            self.device.press("enter")
+
+    def _wait_search_results(self, timeout: float) -> None:
+        self._wait_node(
+            lambda item: item.description in {"综合", "视频", "直播"} or item.text in {"综合", "视频", "直播"},
+            timeout,
+        )
+
+    def _choose_category(self, requested: str) -> str:
+        options = [requested] if requested != "either" else ["video", "live"]
+        labels = {"video": "视频", "live": "直播"}
+        for option in options:
+            label = labels[option]
+            node = self._category_node(label)
+            if not node and option == "live":
+                # Live can be outside the horizontally visible category strip.
+                self.device.swipe(930, 320, 260, 320, duration=0.35)
+                sleep(0.8)
+                node = self._category_node(label)
+            if node and self._activate_category(label):
+                return option
+        raise WorkflowError("搜索结果中没有找到视频或直播分类")
+
+    def _category_node(self, label: str) -> UINode | None:
+        # Restrict matching to the category strip. Result cards may also contain
+        # text such as “直播” and must never be mistaken for a tab.
+        nodes = [
+            item for item in self._nodes()
+            if item.bounds[1] < 450
+            and (item.description == label or item.text == label)
+        ]
+        if not nodes:
+            return None
+        # The outer FrameLayout with content-desc is more reliable than its
+        # child TextView, while a selected tab can legitimately be non-clickable.
+        nodes.sort(key=lambda item: (item.description != label, not item.clickable))
+        return nodes[0]
+
+    def _activate_category(self, label: str) -> bool:
+        deadline = monotonic() + 8
+        while monotonic() < deadline:
+            self._check_cancelled()
+            node = self._category_node(label)
+            if not node:
+                return False
+            if node.selected:
+                return True
+            self.device.click(*node.center)
+            sleep(0.9)
+            # The category bar can shift while results are first rendered.
+            # Re-dump and verify selection instead of trusting stale bounds.
+            selected = self._category_node(label)
+            if selected and selected.selected:
+                sleep(0.5)
+                return True
+        return False
+
+    def _open_first_result(self, content_type: str) -> None:
+        if not self._open_result_at_slot(content_type, 0):
+            raise WorkflowError(f"没有找到可进入的{self._type_label(content_type)}结果")
+
+    def _open_result_at_slot(
+        self, content_type: str, slot: int, timeout: float = 18
+    ) -> bool:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            self._check_cancelled()
+            nodes = self._nodes()
+            candidates = self._result_candidates(nodes, content_type)
+            if len(candidates) > slot:
+                candidates.sort(key=lambda item: (item.bounds[1], item.bounds[0]))
+                self.device.click(*candidates[slot].center)
+                self._wait_content_open(content_type, 15)
+                return True
+            sleep(0.7)
+        return False
+
+    @staticmethod
+    def _result_candidates(nodes: list[UINode], content_type: str) -> list[UINode]:
+        """Return result cards, including TikTok's non-clickable live covers."""
+        if content_type == "live":
+            # On current TikTok builds live cover nodes are deliberately marked
+            # clickable=false. Android still dispatches a tap on their bounds to
+            # the parent GridView, so do not apply the clickable filter here.
+            covers = [
+                item for item in nodes
+                if item.resource_id.endswith("/mm_") and item.bounds[1] >= 360
+                and item.area >= 120_000
+            ]
+            if covers:
+                return covers
+            # Resource IDs can change between releases. Live cards are large,
+            # column-sized FrameLayouts below the category bar; tapping their
+            # centre works even when accessibility exposes no click action.
+            return [
+                item for item in nodes
+                if item.class_name == "android.widget.FrameLayout"
+                and item.bounds[1] >= 360
+                and 400 <= item.bounds[2] - item.bounds[0] <= 650
+                and item.bounds[3] - item.bounds[1] >= 600
+            ]
+
+        covers = [
+            item for item in nodes
+            if item.clickable and item.resource_id.endswith("/umr")
+            and item.bounds[1] >= 360
+        ]
+        if covers:
+            return covers
+        return [
+            item for item in nodes
+            if item.clickable and item.bounds[1] >= 360 and item.area >= 120_000
+            and item.class_name in {"android.widget.FrameLayout", "android.view.ViewGroup"}
+        ]
+
+    def _wait_content_open(self, content_type: str, timeout: float) -> None:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            self._check_cancelled()
+            current = self.device.app_current().get("activity", "").lower()
+            nodes = self._nodes()
+            if content_type == "video" and (
+                "detail" in current or any("评论" in item.description and item.clickable for item in nodes)
+            ):
+                return
+            if content_type == "live" and (
+                "live" in current or any(self._looks_like_chat_input(item) for item in nodes)
+            ):
+                return
+            sleep(0.6)
+        raise WorkflowError(f"进入{self._type_label(content_type)}超时")
+
+    def _open_chat(self, content_type: str) -> None:
+        if content_type == "video":
+            node = self._wait_node(
+                lambda item: item.clickable and "评论" in item.description
+                and ("阅读" in item.description or "添加" in item.description),
+                10,
+            )
+            self.device.click(*node.center)
+            self._wait_node(
+                lambda item: item.class_name.endswith("RecyclerView") or self._looks_like_chat_input(item),
+                10,
+            )
+            return
+        # A live room normally exposes its chat input immediately. Some builds
+        # require one click on a “聊天/评论” affordance first.
+        if any(self._looks_like_chat_input(item) for item in self._nodes()):
+            return
+        entry = self._find_first(lambda item: item.clickable and any(word in (item.description + item.text) for word in ("聊天", "评论", "发言")))
+        if entry:
+            self.device.click(*entry.center)
+        self._wait_node(self._looks_like_chat_input, 10)
+
+    def _collect_video_rooms(
+        self,
+        progress: ProgressCallback,
+        max_comments: int,
+        collection_minutes: float,
+        keyword: str,
+        user_callback: UserCallback | None,
+    ) -> int:
+        started_at = monotonic()
+        deadline = started_at + collection_minutes * 60
+        room_number = 1
+        rooms_entered = 0
+        result_slot = 0
+        total_count = 0
+        empty_result_pages = 0
+        self._emit(
+            progress,
+            "COLLECT_COMMENTS",
+            f"开始定时采集：{collection_minutes:g} 分钟，每个房间最多 {max_comments} 条",
+            60,
+        )
+        while monotonic() < deadline:
+            self._check_cancelled()
+            remaining = max(0, int(deadline - monotonic()))
+            self._emit(
+                progress,
+                "SELECT_CONTENT",
+                f"正在选择第 {room_number} 个视频房间，剩余约 {remaining} 秒",
+                self._timed_progress(started_at, deadline),
+            )
+            opened = self._open_result_at_slot("video", result_slot, timeout=5)
+            if not opened:
+                empty_result_pages += 1
+                if empty_result_pages >= 3:
+                    break
+                self.device.swipe(540, 2050, 540, 650, duration=0.6)
+                sleep(1.0)
+                result_slot = 0
+                continue
+            empty_result_pages = 0
+            result_slot += 1
+            rooms_entered += 1
+            self._emit(
+                progress,
+                "ROOM_STARTED",
+                f"已进入第 {room_number} 个视频房间，正在打开评论区",
+                self._timed_progress(started_at, deadline),
+            )
+            self._open_chat("video")
+            count = self._collect_video_comments(
+                progress,
+                max_comments,
+                deadline=deadline,
+                room_number=room_number,
+                started_at=started_at,
+                keyword=keyword,
+                user_callback=user_callback,
+            )
+            total_count += count
+            self._emit(
+                progress,
+                "ROOM_COMPLETED",
+                f"第 {room_number} 个房间采集完成：{count} 条；累计 {total_count} 条",
+                self._timed_progress(started_at, deadline),
+            )
+            if monotonic() >= deadline:
+                break
+            self._emit(
+                progress,
+                "NEXT_ROOM",
+                f"第 {room_number} 个房间已结束，返回搜索结果继续下一个房间",
+                self._timed_progress(started_at, deadline),
+            )
+            self._return_to_search_results()
+            room_number += 1
+        self._emit(
+            progress,
+            "COLLECTION_FINISHED",
+            f"定时采集结束：共进入 {rooms_entered} 个房间，采集 {total_count} 条留言",
+            100,
+        )
+        return total_count
+
+    @staticmethod
+    def _timed_progress(started_at: float, deadline: float) -> int:
+        duration = max(1.0, deadline - started_at)
+        ratio = min(1.0, max(0.0, (monotonic() - started_at) / duration))
+        return min(98, 60 + int(ratio * 38))
+
+    def _return_to_search_results(self) -> None:
+        for _ in range(5):
+            self._check_cancelled()
+            nodes = self._nodes()
+            has_search = any(item.resource_id.endswith("/hgt") for item in nodes)
+            has_video_tab = any(
+                item.bounds[1] < 450
+                and (item.text == "视频" or item.description == "视频")
+                for item in nodes
+            )
+            if has_search and has_video_tab:
+                if not self._activate_category("视频"):
+                    raise WorkflowError("返回搜索结果后无法重新选择视频分类")
+                return
+            self.device.press("back")
+            sleep(0.8)
+        raise WorkflowError("采集当前房间后无法返回搜索结果")
+
+    def _collect_video_comments(
+        self,
+        progress: ProgressCallback,
+        max_comments: int,
+        *,
+        deadline: float | None = None,
+        room_number: int = 1,
+        started_at: float | None = None,
+        keyword: str = "",
+        user_callback: UserCallback | None = None,
+    ) -> int:
+        collected: set[tuple[str, str]] = set()
+        profile_failures: dict[tuple[str, str], int] = {}
+        stagnant_scrolls = 0
+        last_signature: tuple[tuple[str, str], ...] = ()
+        self._emit(
+            progress,
+            "COLLECT_COMMENTS",
+            f"房间 {room_number}：开始采集评论用户，最多 {max_comments} 条",
+            self._timed_progress(started_at, deadline)
+            if started_at is not None and deadline is not None else 88,
+        )
+        attempts = 0
+        while (
+            len(collected) < max_comments
+            and stagnant_scrolls < 5
+            and (deadline is None or monotonic() < deadline)
+        ):
+            self._check_cancelled()
+            attempts += 1
+            if attempts > max_comments * 6 + 60:
+                break
+            self._ensure_comment_page()
+            entries = self._visible_comment_entries(self._nodes())
+            pending = next(
+                (entry for entry in entries if (entry.username, entry.comment) not in collected),
+                None,
+            )
+            if pending:
+                key = (pending.username, pending.comment)
+                profile = self._read_profile_info(pending.title_node)
+                if profile is None:
+                    profile_failures[key] = profile_failures.get(key, 0) + 1
+                    if profile_failures[key] < 2:
+                        sleep(0.7)
+                        continue
+                    profile = ProfileInfo()
+                collected.add(key)
+                safe_username = self._single_line(pending.username)
+                safe_handle = self._single_line(profile.handle or "@未知")
+                safe_comment = self._single_line(pending.comment)
+                percent = (
+                    self._timed_progress(started_at, deadline)
+                    if started_at is not None and deadline is not None
+                    else min(98, 88 + int(len(collected) / max_comments * 10))
+                )
+                self._emit(
+                    progress,
+                    "COMMENT_COLLECTED",
+                    f"房间：{room_number} | 用户名：{safe_username} | @名字：{safe_handle} | "
+                    f"关注：{profile.following} | 粉丝：{profile.followers} | "
+                    f"赞：{profile.likes} | 留言：{safe_comment}",
+                    percent,
+                )
+                if user_callback is not None and profile.handle:
+                    user_callback({
+                        "username": pending.username,
+                        "handle": profile.handle,
+                        "following": profile.following,
+                        "followers": profile.followers,
+                        "likes": profile.likes,
+                        "comment": pending.comment,
+                        "keyword": keyword,
+                        "room_number": str(room_number),
+                    })
+                # Returning from a profile can slightly reposition the list.
+                # Re-dump before touching the next username; never reuse nodes.
+                sleep(0.5)
+                continue
+
+            signature = tuple((item.username, item.comment) for item in entries)
+            stagnant_scrolls = stagnant_scrolls + 1 if signature == last_signature else 0
+            last_signature = signature
+            self.device.swipe(540, 1990, 540, 1210, duration=0.5)
+            sleep(1.0)
+        return len(collected)
+
+    @staticmethod
+    def _visible_comment_entries(nodes: list[UINode]) -> list[CommentEntry]:
+        grouped: dict[str, list[UINode]] = {}
+        for item in nodes:
+            if item.container_key:
+                grouped.setdefault(item.container_key, []).append(item)
+        grouped_entries: list[CommentEntry] = []
+        for items in grouped.values():
+            title = next((
+                item for item in items
+                if item.resource_id.endswith("/title") and item.text.strip()
+            ), None)
+            comment = next((
+                item for item in items
+                if item.resource_id.endswith("/ewn") and item.text.strip()
+            ), None)
+            if title and comment and title.bounds[1] < 2200 and comment.bounds[1] >= 850:
+                grouped_entries.append(CommentEntry(
+                    title.text.strip(), comment.text.strip(), title
+                ))
+        if grouped_entries:
+            grouped_entries.sort(key=lambda item: item.title_node.bounds[1])
+            return grouped_entries
+
+        # Compatibility fallback for captured/test hierarchies without parent
+        # metadata. Runtime parsing normally uses the container path above.
+        titles = sorted(
+            (
+                item for item in nodes
+                if item.resource_id.endswith("/title")
+                and item.text.strip()
+                and item.bounds[1] >= 850
+                and item.bounds[1] < 2200
+            ),
+            key=lambda item: item.bounds[1],
+        )
+        comments = sorted(
+            (
+                item for item in nodes
+                if item.resource_id.endswith("/ewn")
+                and item.text.strip()
+                and item.bounds[1] >= 850
+                and item.bounds[1] < 2200
+            ),
+            key=lambda item: item.bounds[1],
+        )
+        result: list[CommentEntry] = []
+        for index, title in enumerate(titles):
+            next_top = titles[index + 1].bounds[1] if index + 1 < len(titles) else 2200
+            comment = next((
+                item for item in comments
+                if item.bounds[1] >= title.bounds[3] and item.bounds[1] < next_top
+            ), None)
+            if comment:
+                result.append(CommentEntry(title.text.strip(), comment.text.strip(), title))
+        return result
+
+    def _read_profile_info(self, title_node: UINode) -> ProfileInfo | None:
+        opened_profile = False
+        try:
+            self.device.click(*title_node.center)
+            deadline = monotonic() + 8
+            while monotonic() < deadline:
+                self._check_cancelled()
+                nodes = self._nodes()
+                if any(item.resource_id.endswith("/ed5") for item in nodes):
+                    sleep(0.3)
+                    continue
+                opened_profile = True
+                if any(
+                    "发送给" in (item.text + item.description) for item in nodes
+                ):
+                    return None
+                handle = next((
+                    item.text.strip() for item in nodes
+                    if item.resource_id.endswith("/scn")
+                    and self._valid_handle(item.text.strip())
+                ), "")
+                if not handle:
+                    handle = next((
+                        item.text.strip() for item in nodes
+                        if self._valid_handle(item.text.strip())
+                        and item.bounds[1] < 900
+                    ), "")
+                if handle:
+                    return ProfileInfo(
+                        handle=handle,
+                        following=self._profile_stat(nodes, "关注"),
+                        followers=self._profile_stat(nodes, "粉丝"),
+                        likes=self._profile_stat(nodes, "赞", "获赞"),
+                    )
+                sleep(0.5)
+            return None
+        finally:
+            if opened_profile:
+                self.device.press("back")
+                try:
+                    self._wait_node(
+                        lambda item: item.resource_id.endswith("/ed5")
+                        or item.resource_id.endswith("/vjb"),
+                        8,
+                    )
+                except WorkflowError:
+                    pass
+                sleep(0.5)
+
+    @staticmethod
+    def _valid_handle(value: str) -> bool:
+        return bool(re.fullmatch(r"@[^@\s]{2,}", value.strip()))
+
+    @staticmethod
+    def _profile_stat(nodes: list[UINode], *labels: str) -> str:
+        label_nodes = [
+            item for item in nodes
+            if item.resource_id.endswith("/sb6") and item.text.strip() in labels
+        ]
+        value_nodes = [
+            item for item in nodes
+            if item.resource_id.endswith("/sb7") and item.text.strip()
+        ]
+        if not label_nodes or not value_nodes:
+            return "未知"
+        target_x = label_nodes[0].center[0]
+        value = min(value_nodes, key=lambda item: abs(item.center[0] - target_x))
+        return value.text.strip() or "未知"
+
+    def _ensure_comment_page(self) -> None:
+        for _ in range(3):
+            nodes = self._nodes()
+            if any(
+                item.resource_id.endswith("/ed5") or item.resource_id.endswith("/vjb")
+                for item in nodes
+            ):
+                return
+            # Recover from accidental share/profile sheets without interacting
+            # with any recipient or sending content.
+            self.device.press("back")
+            sleep(0.8)
+        raise WorkflowError("无法返回视频评论区，已停止采集以避免误操作")
+
+    @staticmethod
+    def _single_line(value: str) -> str:
+        return " ".join(value.replace("|", "｜").split())
+
+    @staticmethod
+    def _looks_like_chat_input(item: UINode) -> bool:
+        value = item.text + item.description
+        input_hint = any(
+            word in value
+            for word in ("添加评论", "说点什么", "发言", "聊天", "输入")
+        )
+        return input_hint and item.class_name in {
+            "android.widget.EditText",
+            "android.widget.TextView",
+        }
+
+    def _wait_node(self, predicate: Callable[[UINode], bool], timeout: float) -> UINode:
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            self._check_cancelled()
+            node = self._find_first(predicate)
+            if node:
+                return node
+            sleep(0.5)
+        raise WorkflowError("等待目标控件超时")
+
+    def _find_node(self, *, text: str | None = None, description: str | None = None, class_name: str | None = None, resource_suffix: str | None = None) -> UINode | None:
+        return self._find_first(lambda item: (
+            (text is None or item.text == text)
+            and (description is None or item.description == description)
+            and (class_name is None or item.class_name == class_name)
+            and (resource_suffix is None or item.resource_id.endswith(resource_suffix))
+        ))
+
+    def _find_first(self, predicate: Callable[[UINode], bool]) -> UINode | None:
+        return next((item for item in self._nodes() if predicate(item)), None)
+
+    def _nodes(self) -> list[UINode]:
+        self._check_cancelled()
+        try:
+            root = ET.fromstring(self.device.dump_hierarchy(compressed=False))
+        except Exception as error:
+            raise WorkflowError(f"读取 TikTok 页面结构失败：{error}") from error
+        result: list[UINode] = []
+        parents = {child: parent for parent in root.iter() for child in parent}
+        for element in root.iter("node"):
+            bounds = self._parse_bounds(element.attrib.get("bounds", ""))
+            if not bounds:
+                continue
+            container_key = ""
+            parent = parents.get(element)
+            while parent is not None:
+                if parent.attrib.get("resource-id", "").endswith("/etr"):
+                    container_key = parent.attrib.get("bounds", "")
+                    break
+                parent = parents.get(parent)
+            result.append(UINode(
+                text=element.attrib.get("text", ""),
+                description=element.attrib.get("content-desc", ""),
+                resource_id=element.attrib.get("resource-id", ""),
+                class_name=element.attrib.get("class", ""),
+                clickable=element.attrib.get("clickable") == "true",
+                selected=element.attrib.get("selected") == "true",
+                bounds=bounds,
+                container_key=container_key,
+            ))
+        return result
+
+    @staticmethod
+    def _parse_bounds(value: str) -> tuple[int, int, int, int] | None:
+        match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", value)
+        return tuple(map(int, match.groups())) if match else None
+
+    def _save_evidence(self, prefix: str) -> str:
+        try:
+            self.evidence_root.mkdir(parents=True, exist_ok=True)
+            filename = self.evidence_root / f"{prefix}_{self.serial}_{int(monotonic() * 1000)}.png"
+            image = self.adb.screenshot(self.serial)
+            success, encoded = cv2.imencode(".png", image)
+            if success:
+                encoded.tofile(filename)
+                return str(filename)
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
+    def _type_label(content_type: str) -> str:
+        return "直播" if content_type == "live" else "视频"
