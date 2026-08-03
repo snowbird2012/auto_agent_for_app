@@ -33,6 +33,12 @@ class UserRepository:
 
     def _initialize(self) -> None:
         with self._connect() as db:
+            old_sql_row = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='temporary_users'"
+            ).fetchone()
+            old_sql = str(old_sql_row["sql"] or "") if old_sql_row else ""
+            if old_sql and "'视频'" not in old_sql:
+                self._migrate_source_marks(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS temporary_users (
@@ -43,8 +49,8 @@ class UserRepository:
                     following TEXT NOT NULL DEFAULT '未知',
                     followers TEXT NOT NULL DEFAULT '未知',
                     likes TEXT NOT NULL DEFAULT '未知',
-                    mark TEXT NOT NULL DEFAULT '采集'
-                        CHECK(mark IN ('采集','意向')),
+                    mark TEXT NOT NULL DEFAULT '视频'
+                        CHECK(mark IN ('视频','直播','意向')),
                     tags_json TEXT NOT NULL DEFAULT '[]',
                     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -66,6 +72,52 @@ class UserRepository:
             db.execute("DELETE FROM temporary_users WHERE handle_key IN ('', '@')")
 
     @staticmethod
+    def _migrate_source_marks(db: sqlite3.Connection) -> None:
+        """Preserve existing users while expanding the legacy mark constraint."""
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.executescript(
+            """
+            CREATE TABLE temporary_users_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                handle TEXT NOT NULL,
+                handle_key TEXT NOT NULL UNIQUE,
+                username TEXT NOT NULL DEFAULT '',
+                following TEXT NOT NULL DEFAULT '未知',
+                followers TEXT NOT NULL DEFAULT '未知',
+                likes TEXT NOT NULL DEFAULT '未知',
+                mark TEXT NOT NULL DEFAULT '视频'
+                    CHECK(mark IN ('视频','直播','意向')),
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO temporary_users_new
+            SELECT id,handle,handle_key,username,following,followers,likes,
+                CASE WHEN mark='采集' THEN '视频' ELSE mark END,
+                tags_json,first_seen_at,last_seen_at
+            FROM temporary_users;
+
+            CREATE TABLE temporary_user_comments_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES temporary_users_new(id) ON DELETE CASCADE,
+                task_id INTEGER,
+                keyword TEXT NOT NULL DEFAULT '',
+                comment TEXT NOT NULL,
+                collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, keyword, comment)
+            );
+            INSERT INTO temporary_user_comments_new
+            SELECT id,user_id,task_id,keyword,comment,collected_at
+            FROM temporary_user_comments;
+            DROP TABLE temporary_user_comments;
+            DROP TABLE temporary_users;
+            ALTER TABLE temporary_users_new RENAME TO temporary_users;
+            ALTER TABLE temporary_user_comments_new RENAME TO temporary_user_comments;
+            """
+        )
+        db.execute("PRAGMA foreign_keys=ON")
+
+    @staticmethod
     def _normalize_handle(value: str) -> tuple[str, str]:
         handle = value.strip()
         if handle and not handle.startswith("@"):
@@ -81,22 +133,33 @@ class UserRepository:
         return [str(item).strip() for item in result if str(item).strip()]
 
     def upsert_collected_user(self, record: dict[str, Any]) -> int | None:
+        user_id, _ = self.upsert_collected_user_with_status(record)
+        return user_id
+
+    def upsert_collected_user_with_status(
+        self, record: dict[str, Any]
+    ) -> tuple[int | None, bool]:
         handle, handle_key = self._normalize_handle(str(record.get("handle", "")))
         if len(handle) <= 1 or handle in {"@未知", "@unknown"}:
-            return None
+            return None, False
         keyword = str(record.get("keyword", "")).strip()
+        source_mark = str(record.get("mark", "视频")).strip()
+        if source_mark not in {"视频", "直播"}:
+            source_mark = "视频"
         with self._connect() as db:
             row = db.execute(
-                "SELECT id,tags_json FROM temporary_users WHERE handle_key=?", (handle_key,)
+                "SELECT id,tags_json,mark FROM temporary_users WHERE handle_key=?", (handle_key,)
             ).fetchone()
             if row:
+                created = False
                 user_id = int(row["id"])
+                stored_mark = "意向" if row["mark"] == "意向" else source_mark
                 tags = self._tags(row["tags_json"])
                 if keyword and keyword not in tags:
                     tags.append(keyword)
                 db.execute(
                     """UPDATE temporary_users SET
-                    handle=?,username=?,following=?,followers=?,likes=?,tags_json=?,
+                    handle=?,username=?,following=?,followers=?,likes=?,mark=?,tags_json=?,
                     last_seen_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (
                         handle,
@@ -104,16 +167,18 @@ class UserRepository:
                         str(record.get("following", "未知")).strip() or "未知",
                         str(record.get("followers", "未知")).strip() or "未知",
                         str(record.get("likes", "未知")).strip() or "未知",
+                        stored_mark,
                         json.dumps(tags, ensure_ascii=False),
                         user_id,
                     ),
                 )
             else:
+                created = True
                 tags = [keyword] if keyword else []
                 cursor = db.execute(
                     """INSERT INTO temporary_users
                     (handle,handle_key,username,following,followers,likes,mark,tags_json)
-                    VALUES(?,?,?,?,?,?,'采集',?)""",
+                    VALUES(?,?,?,?,?,?,?,?)""",
                     (
                         handle,
                         handle_key,
@@ -121,6 +186,7 @@ class UserRepository:
                         str(record.get("following", "未知")).strip() or "未知",
                         str(record.get("followers", "未知")).strip() or "未知",
                         str(record.get("likes", "未知")).strip() or "未知",
+                        source_mark,
                         json.dumps(tags, ensure_ascii=False),
                     ),
                 )
@@ -132,7 +198,7 @@ class UserRepository:
                     (user_id,task_id,keyword,comment) VALUES(?,?,?,?)""",
                     (user_id, record.get("task_id"), keyword, comment),
                 )
-        return user_id
+        return user_id, created
 
     def list_users(
         self,
@@ -150,7 +216,7 @@ class UserRepository:
             pattern = f"%{search.strip()}%"
             clauses.append("(u.username LIKE ? OR u.handle LIKE ? OR u.tags_json LIKE ?)")
             parameters.extend([pattern, pattern, pattern])
-        if mark in {"采集", "意向"}:
+        if mark in {"视频", "直播", "意向"}:
             clauses.append("u.mark=?")
             parameters.append(mark)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
@@ -182,8 +248,8 @@ class UserRepository:
         return [dict(row) for row in rows]
 
     def update_mark(self, user_id: int, mark: str) -> None:
-        if mark not in {"采集", "意向"}:
-            raise ValueError("标记只能是采集或意向")
+        if mark not in {"视频", "直播", "意向"}:
+            raise ValueError("标记只能是视频、直播或意向")
         with self._connect() as db:
             db.execute("UPDATE temporary_users SET mark=? WHERE id=?", (mark, user_id))
 
@@ -199,8 +265,8 @@ class UserRepository:
             return int(cursor.rowcount)
 
     def update_users_mark(self, user_ids: list[int], mark: str) -> int:
-        if mark not in {"采集", "意向"}:
-            raise ValueError("标记只能是采集或意向")
+        if mark not in {"视频", "直播", "意向"}:
+            raise ValueError("标记只能是视频、直播或意向")
         ids = sorted({int(item) for item in user_ids})
         if not ids:
             return 0
@@ -215,7 +281,7 @@ class UserRepository:
     def list_collected_users_for_intent(self) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM temporary_users WHERE mark='采集' ORDER BY id"
+                "SELECT * FROM temporary_users WHERE mark IN ('视频','直播') ORDER BY id"
             ).fetchall()
             result: list[dict[str, Any]] = []
             for row in rows:
@@ -240,22 +306,38 @@ class UserRepository:
         if set(intent_ids) & set(non_intent_ids):
             raise ValueError("意向与非意向用户集合不能重叠")
         with self._connect() as db:
-            marked = 0
+            kept = 0
             deleted = 0
             if intent_ids:
                 placeholders = ",".join("?" for _ in intent_ids)
                 cursor = db.execute(
-                    f"""UPDATE temporary_users SET mark='意向'
-                    WHERE mark='采集' AND id IN ({placeholders})""",
+                    f"""SELECT COUNT(*) FROM temporary_users
+                    WHERE mark IN ('视频','直播') AND id IN ({placeholders})""",
                     intent_ids,
                 )
-                marked = int(cursor.rowcount)
+                kept = int(cursor.fetchone()[0])
             if non_intent_ids:
                 placeholders = ",".join("?" for _ in non_intent_ids)
                 cursor = db.execute(
                     f"""DELETE FROM temporary_users
-                    WHERE mark='采集' AND id IN ({placeholders})""",
+                    WHERE mark IN ('视频','直播') AND id IN ({placeholders})""",
                     non_intent_ids,
                 )
                 deleted = int(cursor.rowcount)
-        return marked, deleted
+        return kept, deleted
+
+    def dashboard_user_data(
+        self, start_utc: str, end_utc: str
+    ) -> dict[str, Any]:
+        """Return real user totals and first-seen timestamps for a period."""
+        with self._connect() as db:
+            total = int(db.execute("SELECT COUNT(*) FROM temporary_users").fetchone()[0])
+            rows = db.execute(
+                """SELECT first_seen_at FROM temporary_users
+                WHERE first_seen_at>=? AND first_seen_at<? ORDER BY first_seen_at""",
+                (start_utc, end_utc),
+            ).fetchall()
+        return {
+            "total": total,
+            "first_seen_at": [str(row["first_seen_at"]) for row in rows],
+        }

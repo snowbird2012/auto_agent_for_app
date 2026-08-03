@@ -80,6 +80,13 @@ QPushButton:pressed { background: #101c30; }
 QPushButton#Primary { background: #2563eb; border-color: #3476f4; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #3473ee; }
 QPushButton#DangerButton { color: #fb7185; border-color: #713247; background: #281722; }
+QPushButton#CompactActionButton, QPushButton#CompactDangerButton {
+    min-height: 18px; max-height: 22px; padding: 0px 4px; margin: 0px;
+    border-radius: 5px; font-size: 11px;
+}
+QPushButton#CompactDangerButton {
+    color: #fb7185; border-color: #713247; background: #281722;
+}
 QPushButton#NavButton {
     text-align: left; border: 0; background: transparent; color: #91a2b9;
     padding-left: 18px; min-height: 42px; font-size: 14px;
@@ -140,6 +147,9 @@ QHeaderView::section {
     border: 0; border-bottom: 1px solid #253650; font-weight: 600;
 }
 QTableWidget::item { padding: 8px; border-bottom: 1px solid #17263a; }
+QTableWidget#UserManagementTable::item {
+    padding: 2px 6px; border-bottom: 1px solid #17263a;
+}
 QScrollBar:vertical { background: transparent; width: 9px; margin: 2px; }
 QScrollBar::handle:vertical { background: #2a3b55; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }

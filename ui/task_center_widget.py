@@ -25,8 +25,9 @@ from PySide6.QtWidgets import (
 
 from automation import TikTokSearchWorkflow, WorkflowCancelled
 from devices import ADBClient, AndroidDevice
-from storage import TaskRepository, UserRepository
+from storage import SettingsRepository, TaskRepository, UserRepository
 from ui.widgets import SectionHeader, card_layout, label
+from utils.time_utils import format_utc_timestamp
 
 
 STATUS_LABELS = {
@@ -47,11 +48,15 @@ STEP_LABELS = {
     "OPEN_CONTENT": "进入内容",
     "CHAT_OPENED": "已进入聊天",
     "COLLECT_COMMENTS": "采集评论",
+    "COLLECT_LIVE_USERS": "采集直播观众",
     "COMMENT_COLLECTED": "采集结果",
+    "LIVE_USER_COLLECTED": "采集直播用户",
     "COMMENTS_COLLECTED": "采集完成",
     "ROOM_STARTED": "进入房间",
     "ROOM_COMPLETED": "房间完成",
     "NEXT_ROOM": "切换房间",
+    "ROOM_SKIPPED": "跳过已采集房间",
+    "ROOM_NO_RANKING": "无观众排名",
     "COLLECTION_FINISHED": "采集结束",
     "FAILED": "执行失败",
     "CANCELLED": "已停止",
@@ -65,10 +70,18 @@ class TaskExecutionWorker(QThread):
     cancelled = Signal(int, str)
     user_collected = Signal(int, object)
 
-    def __init__(self, task: dict, adb: ADBClient) -> None:
+    def __init__(
+        self,
+        task: dict,
+        adb: ADBClient,
+        task_repository: TaskRepository,
+        user_repository: UserRepository,
+    ) -> None:
         super().__init__()
         self.task = task
         self.adb = adb
+        self.task_repository = task_repository
+        self.user_repository = user_repository
         self.workflow: TikTokSearchWorkflow | None = None
 
     def stop(self) -> None:
@@ -95,13 +108,27 @@ class TaskExecutionWorker(QThread):
                 ),
                 max_comments=int(self.task.get("max_comments", 20)),
                 collection_minutes=int(self.task.get("collection_minutes", 2)),
-                user_callback=lambda record: self.user_collected.emit(task_id, record),
+                user_callback=lambda record: self._store_user(task_id, record),
+                room_seen_callback=lambda kind, key: self.task_repository.was_room_collected_recently(
+                    kind, key, 24
+                ),
+                room_recorded_callback=lambda kind, key, search_keyword, title: self.task_repository.record_room_collected(
+                    kind, key, search_keyword, title, task_id
+                ),
             )
             self.succeeded.emit(task_id, chosen_type)
         except WorkflowCancelled as error:
             self.cancelled.emit(task_id, str(error))
         except Exception as error:
             self.failed.emit(task_id, str(error))
+
+    def _store_user(self, task_id: int, record: dict) -> bool:
+        values = dict(record)
+        values["task_id"] = task_id
+        user_id, created = self.user_repository.upsert_collected_user_with_status(values)
+        if user_id is not None:
+            self.user_collected.emit(task_id, record)
+        return created
 
 
 class TaskCenterWidget(QWidget):
@@ -114,11 +141,13 @@ class TaskCenterWidget(QWidget):
         adb: ADBClient,
         repository: TaskRepository,
         user_repository: UserRepository,
+        settings_repository: SettingsRepository | None = None,
     ) -> None:
         super().__init__()
         self.adb = adb
         self.repository = repository
         self.user_repository = user_repository
+        self.settings_repository = settings_repository
         self.devices: dict[str, AndroidDevice] = {}
         self.workers: dict[int, TaskExecutionWorker] = {}
         self._build_ui()
@@ -214,14 +243,14 @@ class TaskCenterWidget(QWidget):
         form.addRow("目标应用", self.app_combo)
         form.addRow("搜索关键词", self.keyword_edit)
         form.addRow("结果类型", self.content_combo)
-        form.addRow("每个房间最大评论", self.max_comments_spin)
+        form.addRow("每个房间最大采集数", self.max_comments_spin)
         form.addRow("采集时间", self.collection_minutes_spin)
         form_layout.addLayout(form)
 
         scope = label(
-            "视频任务会采集用户名、@名字、关注数、粉丝数、赞数和留言并写入执行日志；"
-            "达到单房间上限或该房间评论结束后，会在采集时间内继续下一个视频。"
-            "直播任务暂时只进入聊天区域。不会关注用户，也不会发送消息。",
+            "视频任务采集评论用户及留言；直播任务只采集观众排名中的用户，不采集留言。"
+            "达到单房间最大采集数后，会在采集时间内继续下一个房间；"
+            "最近 24 小时内已采集的同一视频或直播间会自动跳过。",
             "Muted",
         )
         scope.setWordWrap(True)
@@ -240,6 +269,36 @@ class TaskCenterWidget(QWidget):
         splitter.setSizes([760, 430])
         layout.addWidget(splitter)
 
+        detail_splitter = QSplitter(Qt.Orientation.Horizontal)
+        rooms_card, rooms_layout = card_layout()
+        rooms_header = QHBoxLayout()
+        rooms_header.addWidget(label("已采集房间", "SectionTitle"))
+        rooms_header.addStretch()
+        select_rooms = QPushButton("全选")
+        select_rooms.clicked.connect(self._select_all_rooms)
+        rooms_header.addWidget(select_rooms)
+        self.delete_rooms_button = QPushButton("批量删除")
+        self.delete_rooms_button.setObjectName("DangerButton")
+        self.delete_rooms_button.clicked.connect(self.delete_selected_rooms)
+        rooms_header.addWidget(self.delete_rooms_button)
+        rooms_layout.addLayout(rooms_header)
+        self.rooms_table = QTableWidget(0, 4)
+        self.rooms_table.setHorizontalHeaderLabels([
+            "类型", "房间", "关键词", "最近采集"
+        ])
+        self.rooms_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rooms_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.rooms_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.rooms_table.setAlternatingRowColors(True)
+        self.rooms_table.setShowGrid(False)
+        self.rooms_table.verticalHeader().setVisible(False)
+        rooms_header_view = self.rooms_table.horizontalHeader()
+        rooms_header_view.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        rooms_header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.rooms_table.setMinimumHeight(170)
+        rooms_layout.addWidget(self.rooms_table)
+        detail_splitter.addWidget(rooms_card)
+
         log_card, log_layout = card_layout()
         log_layout.addWidget(label("执行日志", "SectionTitle"))
         self.log_view = QPlainTextEdit()
@@ -248,7 +307,9 @@ class TaskCenterWidget(QWidget):
         self.log_view.setMaximumBlockCount(500)
         self.log_view.setMinimumHeight(150)
         log_layout.addWidget(self.log_view)
-        layout.addWidget(log_card)
+        detail_splitter.addWidget(log_card)
+        detail_splitter.setSizes([520, 720])
+        layout.addWidget(detail_splitter)
 
         self._selection_changed()
 
@@ -287,8 +348,9 @@ class TaskCenterWidget(QWidget):
         except Exception as error:
             QMessageBox.warning(self, "无法创建任务", str(error))
             return
-        self.name_edit.clear()
-        self.keyword_edit.clear()
+        if not run_after_save:
+            self.name_edit.clear()
+            self.keyword_edit.clear()
         self.refresh_tasks(select_task_id=task_id)
         if run_after_save:
             self.start_task(task_id)
@@ -338,14 +400,21 @@ class TaskCenterWidget(QWidget):
         task = self.repository.get_task(task_id) if task_id is not None else None
         if not task:
             self.log_view.clear()
+            self.rooms_table.setRowCount(0)
+            self.delete_rooms_button.setEnabled(False)
             self.current_progress.setValue(0)
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(False)
             self.delete_button.setEnabled(False)
             return
+        self._refresh_collected_rooms(task_id)
         logs = self.repository.list_logs(task_id)
+        timezone_name = (
+            self.settings_repository.get_timezone()
+            if self.settings_repository is not None else None
+        )
         self.log_view.setPlainText("\n".join(
-            f'[{item["created_at"]}] {item["level"]:<5} '
+            f'[{format_utc_timestamp(item["created_at"], timezone_name)}] {item["level"]:<5} '
             f'{STEP_LABELS.get(item["step"], item["step"])}  {item["message"]}'
             for item in logs
         ))
@@ -360,6 +429,60 @@ class TaskCenterWidget(QWidget):
         self.start_button.setEnabled(not running and not serial_busy and device_ready)
         self.stop_button.setEnabled(running)
         self.delete_button.setEnabled(not running)
+
+    def _refresh_collected_rooms(self, task_id: int) -> None:
+        rooms = self.repository.list_collected_rooms(task_id)
+        timezone_name = (
+            self.settings_repository.get_timezone()
+            if self.settings_repository is not None else None
+        )
+        self.rooms_table.setRowCount(len(rooms))
+        type_labels = {"video": "视频", "live": "直播"}
+        for row, room in enumerate(rooms):
+            title = room["room_title"] or room["content_key"][:12]
+            values = [
+                type_labels.get(room["content_type"], room["content_type"]),
+                title,
+                room["keyword"],
+                format_utc_timestamp(room["last_collected_at"], timezone_name),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(room["id"]))
+                item.setToolTip(str(value))
+                self.rooms_table.setItem(row, column, item)
+        self.delete_rooms_button.setEnabled(bool(rooms))
+
+    def _select_all_rooms(self) -> None:
+        if self.rooms_table.rowCount():
+            self.rooms_table.selectAll()
+
+    def delete_selected_rooms(self) -> None:
+        task_id = self.selected_task_id()
+        if task_id is None:
+            return
+        room_ids: list[int] = []
+        for index in self.rooms_table.selectionModel().selectedRows(0):
+            item = self.rooms_table.item(index.row(), 0)
+            value = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if value is not None:
+                room_ids.append(int(value))
+        room_ids = sorted(set(room_ids))
+        if not room_ids:
+            QMessageBox.information(self, "批量删除", "请先选择至少一个已采集房间。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除采集记录",
+            f"确定删除选中的 {len(room_ids)} 条房间记录吗？\n"
+            "删除后，这些房间可以立即再次采集。",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        deleted = self.repository.delete_collected_rooms(room_ids, task_id)
+        self._refresh_collected_rooms(task_id)
+        QMessageBox.information(self, "删除完成", f"已删除 {deleted} 条房间记录。")
 
     def start_selected_task(self) -> None:
         task_id = self.selected_task_id()
@@ -385,7 +508,9 @@ class TaskCenterWidget(QWidget):
             keyword=task["keywords"][0], error="",
         )
         self.repository.add_log(task_id, "INFO", "START_APP", "任务开始执行")
-        worker = TaskExecutionWorker(task, self.adb)
+        worker = TaskExecutionWorker(
+            task, self.adb, self.repository, self.user_repository
+        )
         worker.progress_changed.connect(self._task_progress)
         worker.succeeded.connect(self._task_succeeded)
         worker.failed.connect(self._task_failed)
@@ -420,25 +545,21 @@ class TaskCenterWidget(QWidget):
 
     def _task_progress(self, task_id: int, step: str, message: str, percent: int) -> None:
         task = self.repository.get_task(task_id)
-        if step == "COMMENT_COLLECTED" or not task or task["current_step"] != step:
+        if step in {"COMMENT_COLLECTED", "LIVE_USER_COLLECTED"} or not task or task["current_step"] != step:
             self.repository.add_log(task_id, "INFO", step, message)
         self.repository.update_runtime(task_id, status="running", step=step, progress=percent)
         self.refresh_tasks(select_task_id=task_id)
 
     def _user_collected(self, task_id: int, record: dict) -> None:
-        values = dict(record)
-        values["task_id"] = task_id
-        self.user_repository.upsert_collected_user(values)
         self.users_updated.emit()
 
     def _task_succeeded(self, task_id: int, chosen_type: str) -> None:
         type_text = "直播" if chosen_type == "live" else "视频"
         if chosen_type == "video":
             message = "视频房间轮询采集完成，用户信息与留言已写入执行日志"
-            final_step = "COLLECTION_FINISHED"
         else:
-            message = f"第一阶段完成：已进入{type_text}聊天区域，未发送任何消息"
-            final_step = "CHAT_OPENED"
+            message = f"{type_text}房间轮询采集完成，观众排名用户已写入执行日志"
+        final_step = "COLLECTION_FINISHED"
         self.repository.update_runtime(
             task_id, status="completed", step=final_step, progress=100, error=""
         )

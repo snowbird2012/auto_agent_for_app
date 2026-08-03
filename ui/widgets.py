@@ -46,12 +46,15 @@ class MetricCard(QFrame):
         outer.addLayout(top)
         self.value_label = label(value, "Metric")
         outer.addWidget(self.value_label)
-        hint = label(note, "Small")
-        hint.setStyleSheet(f"color:{accent};")
-        outer.addWidget(hint)
+        self.note_label = label(note, "Small")
+        self.note_label.setStyleSheet(f"color:{accent};")
+        outer.addWidget(self.note_label)
 
     def set_value(self, value: str) -> None:
         self.value_label.setText(value)
+
+    def set_note(self, note: str) -> None:
+        self.note_label.setText(note)
 
 
 class SectionHeader(QWidget):
@@ -73,6 +76,10 @@ class MiniChart(QWidget):
         self.values = values
         self.setMinimumHeight(175)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_values(self, values: list[int]) -> None:
+        self.values = list(values)
+        self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)

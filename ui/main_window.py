@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from functools import partial
+from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
@@ -46,7 +48,7 @@ from ui.proxy_settings_widget import ProxySettingsWidget
 from ui.task_center_widget import TaskCenterWidget
 from ui.user_management_widget import UserManagementWidget
 from ui.widgets import DeviceStatusCard, MetricCard, MiniChart, SectionHeader, card_layout, label
-from utils.time_utils import COMMON_TIMEZONES
+from utils.time_utils import COMMON_TIMEZONES, format_utc_timestamp
 
 
 NAV_ITEMS = [
@@ -97,7 +99,10 @@ class MainWindow(QMainWindow):
         self.device_page.devices_updated.connect(self._update_dashboard_devices)
         self.pages.addWidget(self._scroll_page(self.device_page))
         self.task_page = TaskCenterWidget(
-            self.adb_client, self.task_repository, self.user_repository
+            self.adb_client,
+            self.task_repository,
+            self.user_repository,
+            self.settings_repository,
         )
         self.device_page.devices_updated.connect(self.task_page.update_devices)
         self.pages.addWidget(self._scroll_page(self.task_page))
@@ -170,9 +175,9 @@ class MainWindow(QMainWindow):
         search.setPlaceholderText("搜索联系人、任务或设备...")
         search.setFixedWidth(270)
         layout.addWidget(search)
-        notice = QPushButton("●  3 条待处理")
-        notice.clicked.connect(lambda: self._switch_page(5))
-        layout.addWidget(notice)
+        self.dashboard_notice = QPushButton("暂无失败任务")
+        self.dashboard_notice.clicked.connect(lambda: self._switch_page(2))
+        layout.addWidget(self.dashboard_notice)
         avatar = QLabel("管")
         avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         avatar.setFixedSize(36, 36)
@@ -185,6 +190,8 @@ class MainWindow(QMainWindow):
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
         self.breadcrumb.setText(f"工作台  /  {NAV_ITEMS[index]}")
+        if index == 0 and hasattr(self, "dashboard_metrics"):
+            self._refresh_dashboard_data()
 
     @staticmethod
     def _scroll_page(content: QWidget) -> QScrollArea:
@@ -207,7 +214,7 @@ class MainWindow(QMainWindow):
     def _dashboard_page(self) -> QWidget:
         page, layout = self._page()
         header_row = QHBoxLayout()
-        header_row.addWidget(SectionHeader("运营总览", "查看今日设备运行、用户触达与会话进展"))
+        header_row.addWidget(SectionHeader("运营总览", "查看真实设备、任务、房间与用户采集数据"))
         header_row.addStretch()
         refresh = QPushButton("刷新数据")
         refresh.clicked.connect(self._toast_refresh)
@@ -222,12 +229,14 @@ class MainWindow(QMainWindow):
         metrics.setHorizontalSpacing(14)
         metric_data = [
             ("在线设备", "—", "等待 ADB 扫描", "blue"),
-            ("今日发现用户", "186", "↑ 12.4% 较昨日", "green"),
-            ("今日新增关注", "42", "任务额度剩余 58", "orange"),
-            ("待处理会话", "8", "3 条需要人工审核", "pink"),
+            ("今日发现用户", "0", "临时用户库共 0 位", "green"),
+            ("今日采集房间", "0", "视频 0 · 直播 0", "orange"),
+            ("执行中任务", "0", "今日完成 0 · 失败 0", "pink"),
         ]
+        self.dashboard_metrics: dict[str, MetricCard] = {}
         for index, values in enumerate(metric_data):
             card = MetricCard(*values)
+            self.dashboard_metrics[values[0]] = card
             if index == 0:
                 self.dashboard_device_metric = card
             metrics.addWidget(card, 0, index)
@@ -236,35 +245,27 @@ class MainWindow(QMainWindow):
         middle = QHBoxLayout()
         trend, trend_layout = card_layout()
         trend_header = QHBoxLayout()
-        trend_header.addWidget(label("近 7 日用户触达", "SectionTitle"))
+        trend_header.addWidget(label("近 7 日发现用户", "SectionTitle"))
         trend_header.addStretch()
         trend_header.addWidget(label("● 发现用户", "PillBlue"))
         trend_layout.addLayout(trend_header)
-        trend_layout.addWidget(MiniChart([74, 108, 96, 147, 132, 169, 186]))
+        self.dashboard_chart = MiniChart([0, 0, 0, 0, 0, 0, 0])
+        trend_layout.addWidget(self.dashboard_chart)
         days = QHBoxLayout()
-        for day in ["周一", "周二", "周三", "周四", "周五", "周六", "今天"]:
-            item = label(day, "Small")
+        self.dashboard_day_labels: list[QLabel] = []
+        for _ in range(7):
+            item = label("—", "Small")
             item.setAlignment(Qt.AlignmentFlag.AlignCenter)
             days.addWidget(item)
+            self.dashboard_day_labels.append(item)
         trend_layout.addLayout(days)
         middle.addWidget(trend, 3)
 
         activity, activity_layout = card_layout()
         activity_layout.addWidget(label("实时动态", "SectionTitle"))
-        events = [
-            ("●", "系统", "等待真实任务事件", "设备连接后开始记录", "#3b82f6"),
-        ]
-        for icon, source, text, when, color in events:
-            row = QHBoxLayout()
-            dot = QLabel(icon)
-            dot.setStyleSheet(f"color:{color};")
-            row.addWidget(dot)
-            info = QVBoxLayout()
-            info.addWidget(label(f"{source} · {text}"))
-            info.addWidget(label(when, "Small"))
-            row.addLayout(info)
-            row.addStretch()
-            activity_layout.addLayout(row)
+        self.dashboard_activity_list = QVBoxLayout()
+        self.dashboard_activity_list.setSpacing(10)
+        activity_layout.addLayout(self.dashboard_activity_list)
         activity_layout.addStretch()
         middle.addWidget(activity, 2)
         layout.addLayout(middle)
@@ -275,7 +276,93 @@ class MainWindow(QMainWindow):
         self.dashboard_device_grid.addWidget(label("正在读取 ADB 设备…", "Muted"), 0, 0)
         layout.addLayout(self.dashboard_device_grid)
         layout.addStretch()
+        self._refresh_dashboard_data()
         return page
+
+    @staticmethod
+    def _utc_text(value: datetime) -> str:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _refresh_dashboard_data(self) -> None:
+        timezone_name = self.settings_repository.get_timezone()
+        target_zone = ZoneInfo(timezone_name)
+        now = datetime.now(target_zone)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow_start = today_start + timedelta(days=1)
+        week_start = today_start - timedelta(days=6)
+
+        user_data = self.user_repository.dashboard_user_data(
+            self._utc_text(week_start), self._utc_text(tomorrow_start)
+        )
+        daily_counts = [0] * 7
+        for value in user_data["first_seen_at"]:
+            try:
+                source = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+                day_index = (source.astimezone(target_zone).date() - week_start.date()).days
+                if 0 <= day_index < 7:
+                    daily_counts[day_index] += 1
+            except ValueError:
+                continue
+        self.dashboard_chart.set_values(daily_counts)
+        for index, item in enumerate(self.dashboard_day_labels):
+            day = week_start + timedelta(days=index)
+            item.setText("今天" if index == 6 else day.strftime("%m-%d"))
+
+        today_users = daily_counts[-1]
+        yesterday_users = daily_counts[-2]
+        user_metric = self.dashboard_metrics["今日发现用户"]
+        user_metric.set_value(str(today_users))
+        user_metric.set_note(
+            f"昨日 {yesterday_users} 位 · 临时用户库共 {user_data['total']} 位"
+        )
+
+        task_data = self.task_repository.dashboard_task_data(
+            self._utc_text(today_start), self._utc_text(tomorrow_start)
+        )
+        video_rooms = task_data["rooms_today"].get("video", 0)
+        live_rooms = task_data["rooms_today"].get("live", 0)
+        room_metric = self.dashboard_metrics["今日采集房间"]
+        room_metric.set_value(str(video_rooms + live_rooms))
+        room_metric.set_note(f"视频 {video_rooms} · 直播 {live_rooms}")
+
+        running = task_data["statuses"].get("running", 0)
+        completed = task_data["finished_today"].get("completed", 0)
+        failed_today = task_data["finished_today"].get("failed", 0)
+        task_metric = self.dashboard_metrics["执行中任务"]
+        task_metric.set_value(str(running))
+        task_metric.set_note(f"今日完成 {completed} · 失败 {failed_today}")
+        failed_total = task_data["statuses"].get("failed", 0)
+        self.dashboard_notice.setText(
+            f"●  {failed_total} 个失败任务" if failed_total else "暂无失败任务"
+        )
+
+        while self.dashboard_activity_list.count():
+            item = self.dashboard_activity_list.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        activities = task_data["activities"]
+        if not activities:
+            self.dashboard_activity_list.addWidget(
+                label("暂无任务执行记录", "Muted")
+            )
+            return
+        colors = {"ERROR": "#fb7185", "WARN": "#f59e0b", "INFO": "#3b82f6"}
+        for event in activities:
+            holder = QWidget()
+            row = QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color:{colors.get(event['level'], '#3b82f6')};")
+            row.addWidget(dot)
+            info = QVBoxLayout()
+            message = QLabel(f"{event['task_name']} · {event['message']}")
+            message.setWordWrap(True)
+            info.addWidget(message)
+            info.addWidget(label(
+                format_utc_timestamp(event["created_at"], timezone_name), "Small"
+            ))
+            row.addLayout(info, 1)
+            self.dashboard_activity_list.addWidget(holder)
 
     def _update_dashboard_devices(self, devices: list[AndroidDevice]) -> None:
         while self.dashboard_device_grid.count():
@@ -284,6 +371,9 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
         online = [device for device in devices if device.authorized]
         self.dashboard_device_metric.set_value(f"{len(online)} / {len(devices)}")
+        self.dashboard_device_metric.set_note(
+            f"已连接 {len(online)} · 未就绪 {len(devices) - len(online)}"
+        )
         self.sidebar_device_status.setText(f"{len(online)} 台设备在线 · ADB 实时数据")
         if not devices:
             self.dashboard_device_grid.addWidget(label("未发现 Android 设备，请检查 USB 连接和调试授权。", "Muted"), 0, 0)
@@ -559,6 +649,9 @@ class MainWindow(QMainWindow):
         self._info("模拟发送成功", "回复已添加到 UI 演示流程；当前未连接真实 TikTok。")
 
     def _toast_refresh(self) -> None:
+        self._refresh_dashboard_data()
+        if hasattr(self, "device_page"):
+            self.device_page.scan_devices()
         self.breadcrumb.setText("工作台  /  运营总览  ·  刚刚更新")
         QTimer.singleShot(1800, lambda: self.breadcrumb.setText("工作台  /  运营总览"))
 

@@ -117,7 +117,7 @@ class UserManagementWidget(QWidget):
         header = QHBoxLayout()
         header.addWidget(SectionHeader(
             "用户管理",
-            "查看自动化任务采集的未筛选用户；默认标记为“采集”",
+            "查看自动化任务采集的未筛选用户；标记显示用户来源",
         ))
         header.addStretch()
         self.total_label = label("共 0 位用户", "Muted")
@@ -138,7 +138,8 @@ class UserManagementWidget(QWidget):
         self.search_edit.returnPressed.connect(self.apply_filters)
         self.mark_combo = QComboBox()
         self.mark_combo.addItem("全部标记", "")
-        self.mark_combo.addItem("采集", "采集")
+        self.mark_combo.addItem("视频", "视频")
+        self.mark_combo.addItem("直播", "直播")
         self.mark_combo.addItem("意向", "意向")
         self.mark_combo.currentIndexChanged.connect(self.apply_filters)
         search_button = QPushButton("查询")
@@ -155,6 +156,7 @@ class UserManagementWidget(QWidget):
 
         table_card, table_layout = card_layout()
         self.table = QTableWidget(0, 10)
+        self.table.setObjectName("UserManagementTable")
         self.table.setHorizontalHeaderLabels([
             "用户名", "@名字", "标记", "关注", "粉丝", "赞", "留言数",
             "用户标签", "最近采集", "操作",
@@ -169,11 +171,11 @@ class UserManagementWidget(QWidget):
         header_view.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
-        header_view.resizeSection(7, 150)
-        header_view.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
+        header_view.resizeSection(8, 180)
         header_view.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
-        header_view.resizeSection(9, 180)
+        header_view.resizeSection(9, 128)
         self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.setMinimumHeight(360)
@@ -240,12 +242,16 @@ class UserManagementWidget(QWidget):
             )
         self.table.setRowCount(len(users))
         timezone_name = self.settings_repository.get_timezone()
+        header_metrics = self.table.horizontalHeader().fontMetrics()
+        cell_metrics = self.table.fontMetrics()
+        recent_column_width = header_metrics.horizontalAdvance("最近采集") + 24
         for row, user in enumerate(users):
+            recent_text = format_utc_timestamp(user["last_seen_at"], timezone_name)
             values = [
                 user["username"], user["handle"], user["mark"],
                 user["following"], user["followers"], user["likes"],
                 str(user["comment_count"]), "",
-                format_utc_timestamp(user["last_seen_at"], timezone_name),
+                recent_text,
                 "",
             ]
             for column, value in enumerate(values):
@@ -253,15 +259,23 @@ class UserManagementWidget(QWidget):
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, int(user["id"]))
                 if column == 2:
-                    item.setForeground(
-                        Qt.GlobalColor.green if value == "意向" else Qt.GlobalColor.cyan
-                    )
+                    colors = {
+                        "意向": Qt.GlobalColor.green,
+                        "直播": Qt.GlobalColor.magenta,
+                        "视频": Qt.GlobalColor.cyan,
+                    }
+                    item.setForeground(colors.get(str(value), Qt.GlobalColor.white))
                 self.table.setItem(row, column, item)
             self.table.setCellWidget(row, 7, self._tag_widget(user["tags"]))
             self.table.setCellWidget(
                 row, 9, self._operation_widget(int(user["id"]), user["mark"])
             )
             self.table.setRowHeight(row, 40)
+            recent_column_width = max(
+                recent_column_width,
+                cell_metrics.horizontalAdvance(recent_text) + 18,
+            )
+        self.table.horizontalHeader().resizeSection(8, recent_column_width)
         self.total_label.setText(f"共 {self.total} 位用户")
         self.page_label.setText(f"第 {self.page} / {page_count} 页 · 每页 {self.PAGE_SIZE} 条")
         self.prev_button.setEnabled(self.page > 1)
@@ -274,15 +288,26 @@ class UserManagementWidget(QWidget):
     @staticmethod
     def _tag_widget(tags: list[str]) -> QWidget:
         container = QWidget()
+        # QTableWidget otherwise shrinks cell widgets to their size hint
+        # (about 19 px under the app stylesheet), clipping pills vertically.
+        container.setMinimumHeight(28)
+        estimated_width = (
+            12 + sum(max(38, len(tag) * 13 + 18) for tag in tags)
+            + max(0, len(tags) - 1) * 3
+        )
+        container.setMinimumWidth(max(180, estimated_width))
         row = QHBoxLayout(container)
-        row.setContentsMargins(2, 2, 2, 2)
+        row.setContentsMargins(2, 0, 2, 0)
         row.setSpacing(3)
+        row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         for tag in tags:
             background, foreground = TAG_COLORS[sum(ord(char) for char in tag) % len(TAG_COLORS)]
             item = QLabel(tag)
+            item.setFixedHeight(20)
+            item.setAlignment(Qt.AlignmentFlag.AlignCenter)
             item.setStyleSheet(
-                f"background:{background}; color:{foreground}; border-radius:8px; "
-                "padding:2px 6px; font-size:12px;"
+                f"background:{background}; color:{foreground}; border-radius:7px; "
+                "padding:0px 6px; font-size:11px;"
             )
             row.addWidget(item)
         row.addStretch()
@@ -290,14 +315,19 @@ class UserManagementWidget(QWidget):
 
     def _operation_widget(self, user_id: int, mark: str) -> QWidget:
         container = QWidget()
+        container.setMinimumHeight(28)
         row = QHBoxLayout(container)
-        row.setContentsMargins(2, 2, 2, 2)
+        row.setContentsMargins(2, 0, 2, 0)
         row.setSpacing(4)
-        intent = QPushButton("标记意向")
+        row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        intent = QPushButton("意向")
+        intent.setObjectName("CompactActionButton")
+        intent.setFixedSize(54, 24)
         intent.setEnabled(mark != "意向")
         intent.clicked.connect(lambda: self.mark_user_intent(user_id))
         delete = QPushButton("删除")
-        delete.setObjectName("DangerButton")
+        delete.setObjectName("CompactDangerButton")
+        delete.setFixedSize(48, 24)
         delete.clicked.connect(lambda: self.delete_users([user_id]))
         row.addWidget(intent)
         row.addWidget(delete)
@@ -370,7 +400,7 @@ class UserManagementWidget(QWidget):
             return
         users = self.repository.list_collected_users_for_intent()
         if not users:
-            QMessageBox.information(self, "筛选意向用户", "当前没有标记为“采集”的用户。")
+            QMessageBox.information(self, "筛选意向用户", "当前没有来源为“视频”或“直播”的用户。")
             return
         dialog = IntentFilterDialog(self.settings_repository, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -385,7 +415,7 @@ class UserManagementWidget(QWidget):
             QMessageBox.warning(self, "无法开始判断", "模型所属的 API 厂家不存在。")
             return
         self.intent_progress = QProgressDialog(
-            f"正在将 {len(users)} 位采集用户的全部留言提交给模型判断……",
+            f"正在将 {len(users)} 位视频/直播用户的信息与留言提交给模型判断……",
             "取消",
             0,
             0,
@@ -417,7 +447,7 @@ class UserManagementWidget(QWidget):
             self,
             "意向判断完成",
             f"模型判断完成：\n\n"
-            f"意向用户：{len(intent_ids)} 位，将标记为“意向”\n"
+            f"意向用户：{len(intent_ids)} 位，将保留原来源标记\n"
             f"非意向用户：{len(non_intent_ids)} 位，将从临时用户库删除\n\n"
             "是否执行以上操作？选择“否”不会修改任何数据。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -426,12 +456,12 @@ class UserManagementWidget(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             QMessageBox.information(self, "未执行", "判断结果已放弃，用户数据没有发生变化。")
             return
-        marked, deleted = self.repository.apply_intent_results(intent_ids, non_intent_ids)
+        kept, deleted = self.repository.apply_intent_results(intent_ids, non_intent_ids)
         self.refresh_users()
         QMessageBox.information(
             self,
             "操作完成",
-            f"已标记 {marked} 位意向用户，删除 {deleted} 位非意向用户。",
+            f"已保留 {kept} 位意向用户（来源标记未改变），删除 {deleted} 位非意向用户。",
         )
 
     def _intent_filter_failed(self, message: str) -> None:

@@ -34,7 +34,7 @@ class IntentFilterDialog(QDialog):
         layout.setSpacing(14)
 
         note = QLabel(
-            "将所有标记为“采集”的用户及其全部留言一次性提交给所选大语言模型。"
+            "将所有来源为“视频”或“直播”的用户及其全部留言一次性提交给所选大语言模型。"
             "模型只生成预览，确认后才会修改或删除数据。"
         )
         note.setWordWrap(True)
@@ -88,4 +88,3 @@ class IntentFilterDialog(QDialog):
 
     def values(self) -> tuple[int, str]:
         return int(self.model_combo.currentData()), self.prompt_edit.toPlainText().strip()
-

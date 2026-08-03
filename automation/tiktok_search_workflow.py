@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import re
 from threading import Event
 from time import monotonic, sleep
 from typing import Callable
+import unicodedata
 import xml.etree.ElementTree as ET
 
 import cv2
@@ -55,6 +57,7 @@ class CommentEntry:
 
 @dataclass(slots=True)
 class ProfileInfo:
+    username: str = ""
     handle: str = ""
     following: str = "未知"
     followers: str = "未知"
@@ -62,7 +65,9 @@ class ProfileInfo:
 
 
 ProgressCallback = Callable[[str, str, int], None]
-UserCallback = Callable[[dict[str, str]], None]
+UserCallback = Callable[[dict[str, str]], bool | None]
+RoomSeenCallback = Callable[[str, str], bool]
+RoomRecordedCallback = Callable[[str, str, str, str], None]
 
 
 class TikTokSearchWorkflow:
@@ -72,6 +77,8 @@ class TikTokSearchWorkflow:
         self.package = package
         self.device = None
         self.cancel_event = Event()
+        self._last_result_hint = ""
+        self._last_room_label = ""
         root = Path(__file__).resolve().parents[1]
         self.evidence_root = Path(evidence_root) if evidence_root else root / "data" / "evidence" / "tasks"
 
@@ -86,6 +93,8 @@ class TikTokSearchWorkflow:
         max_comments: int = 20,
         collection_minutes: float = 2,
         user_callback: UserCallback | None = None,
+        room_seen_callback: RoomSeenCallback | None = None,
+        room_recorded_callback: RoomRecordedCallback | None = None,
     ) -> str:
         keyword = keyword.strip()
         if not keyword:
@@ -116,13 +125,19 @@ class TikTokSearchWorkflow:
                     max(0.1, min(1440.0, float(collection_minutes))),
                     keyword,
                     user_callback,
+                    room_seen_callback,
+                    room_recorded_callback,
                 )
             else:
-                self._emit(progress, "SELECT_CONTENT", "正在选择第一个直播结果", 65)
-                self._open_first_result(chosen_type)
-                self._emit(progress, "OPEN_CONTENT", "已进入直播，正在定位聊天入口", 82)
-                self._open_chat(chosen_type)
-                self._emit(progress, "CHAT_OPENED", "已进入直播聊天区域", 100)
+                self._collect_live_rooms(
+                    progress,
+                    max(1, min(200, int(max_comments))),
+                    max(0.1, min(1440.0, float(collection_minutes))),
+                    keyword,
+                    user_callback,
+                    room_seen_callback,
+                    room_recorded_callback,
+                )
             return chosen_type
         except WorkflowCancelled:
             raise
@@ -152,15 +167,35 @@ class TikTokSearchWorkflow:
         raise WorkflowError("TikTok 启动超时")
 
     def _open_search(self) -> None:
-        # If TikTok was left on its search page, reuse it directly.
-        if self._find_node(class_name="android.widget.EditText", resource_suffix="/hgt"):
-            return
-        node = self._wait_node(lambda item: item.description == "搜索" and item.clickable, 10)
-        self.device.click(*node.center)
-        self._wait_node(lambda item: item.class_name == "android.widget.EditText", 10)
+        # TikTok can reopen on the Tako chat page. Only the real search field
+        # (`hgt`) is accepted; generic EditTexts would submit the keyword to
+        # Tako instead of executing a TikTok content search.
+        for _ in range(6):
+            if self._find_node(
+                class_name="android.widget.EditText", resource_suffix="/hgt"
+            ):
+                return
+            node = self._find_first(
+                lambda item: item.description == "搜索"
+                and item.clickable and item.bounds[1] < 500
+            )
+            if node:
+                self.device.click(*node.center)
+                try:
+                    self._wait_node(
+                        lambda item: item.class_name == "android.widget.EditText"
+                        and item.resource_id.endswith("/hgt"),
+                        4,
+                    )
+                    return
+                except WorkflowError:
+                    pass
+            self.device.press("back")
+            sleep(0.8)
+        raise WorkflowError("无法打开 TikTok 搜索页面")
 
     def _enter_keyword(self, keyword: str) -> None:
-        field = self.device(className="android.widget.EditText")
+        field = self.device(resourceId=f"{self.package}:id/hgt")
         if not field.wait(timeout=8):
             raise WorkflowError("未找到搜索输入框")
         field.click()
@@ -176,7 +211,13 @@ class TikTokSearchWorkflow:
 
     def _wait_search_results(self, timeout: float) -> None:
         self._wait_node(
-            lambda item: item.description in {"综合", "视频", "直播"} or item.text in {"综合", "视频", "直播"},
+            lambda item: (
+                item.bounds[1] < 450
+                and (
+                    item.description in {"综合", "视频", "直播"}
+                    or item.text in {"综合", "视频", "直播"}
+                )
+            ),
             timeout,
         )
 
@@ -185,14 +226,22 @@ class TikTokSearchWorkflow:
         labels = {"video": "视频", "live": "直播"}
         for option in options:
             label = labels[option]
-            node = self._category_node(label)
-            if not node and option == "live":
-                # Live can be outside the horizontally visible category strip.
-                self.device.swipe(930, 320, 260, 320, duration=0.35)
-                sleep(0.8)
+            deadline = monotonic() + 12
+            swipe_index = 0
+            while monotonic() < deadline:
+                self._check_cancelled()
                 node = self._category_node(label)
-            if node and self._activate_category(label):
-                return option
+                if node and self._activate_category(label):
+                    return option
+                # TikTok loads and repositions the horizontal category strip
+                # asynchronously. Search in both directions, starting the
+                # gesture outside the fixed Tako tab so it reaches the strip.
+                if swipe_index % 2 == 0:
+                    self.device.swipe(880, 320, 300, 320, duration=0.35)
+                else:
+                    self.device.swipe(760, 320, 1030, 320, duration=0.35)
+                swipe_index += 1
+                sleep(0.8)
         raise WorkflowError("搜索结果中没有找到视频或直播分类")
 
     def _category_node(self, label: str) -> UINode | None:
@@ -243,7 +292,11 @@ class TikTokSearchWorkflow:
             candidates = self._result_candidates(nodes, content_type)
             if len(candidates) > slot:
                 candidates.sort(key=lambda item: (item.bounds[1], item.bounds[0]))
-                self.device.click(*candidates[slot].center)
+                candidate = candidates[slot]
+                self._last_result_hint = self._single_line(
+                    candidate.description or candidate.text
+                )
+                self.device.click(*candidate.center)
                 self._wait_content_open(content_type, 15)
                 return True
             sleep(0.7)
@@ -333,6 +386,8 @@ class TikTokSearchWorkflow:
         collection_minutes: float,
         keyword: str,
         user_callback: UserCallback | None,
+        room_seen_callback: RoomSeenCallback | None,
+        room_recorded_callback: RoomRecordedCallback | None,
     ) -> int:
         started_at = monotonic()
         deadline = started_at + collection_minutes * 60
@@ -344,7 +399,7 @@ class TikTokSearchWorkflow:
         self._emit(
             progress,
             "COLLECT_COMMENTS",
-            f"开始定时采集：{collection_minutes:g} 分钟，每个房间最多 {max_comments} 条",
+            f"开始定时采集：{collection_minutes:g} 分钟，每个房间最多采集 {max_comments} 位用户",
             60,
         )
         while monotonic() < deadline:
@@ -367,6 +422,16 @@ class TikTokSearchWorkflow:
                 continue
             empty_result_pages = 0
             result_slot += 1
+            room_key = self._room_identity("video")
+            if room_seen_callback and room_seen_callback("video", room_key):
+                self._emit(
+                    progress,
+                    "ROOM_SKIPPED",
+                    "该视频在最近 24 小时内已采集，跳过并继续下一个视频",
+                    self._timed_progress(started_at, deadline),
+                )
+                self._return_to_search_results("video")
+                continue
             rooms_entered += 1
             self._emit(
                 progress,
@@ -384,6 +449,10 @@ class TikTokSearchWorkflow:
                 keyword=keyword,
                 user_callback=user_callback,
             )
+            if room_recorded_callback:
+                room_recorded_callback(
+                    "video", room_key, keyword, self._last_room_label
+                )
             total_count += count
             self._emit(
                 progress,
@@ -399,12 +468,12 @@ class TikTokSearchWorkflow:
                 f"第 {room_number} 个房间已结束，返回搜索结果继续下一个房间",
                 self._timed_progress(started_at, deadline),
             )
-            self._return_to_search_results()
+            self._return_to_search_results("video")
             room_number += 1
         self._emit(
             progress,
             "COLLECTION_FINISHED",
-            f"定时采集结束：共进入 {rooms_entered} 个房间，采集 {total_count} 条留言",
+            f"定时采集结束：共进入 {rooms_entered} 个房间，采集 {total_count} 位用户",
             100,
         )
         return total_count
@@ -415,19 +484,20 @@ class TikTokSearchWorkflow:
         ratio = min(1.0, max(0.0, (monotonic() - started_at) / duration))
         return min(98, 60 + int(ratio * 38))
 
-    def _return_to_search_results(self) -> None:
+    def _return_to_search_results(self, content_type: str = "video") -> None:
+        category = self._type_label(content_type)
         for _ in range(5):
             self._check_cancelled()
             nodes = self._nodes()
             has_search = any(item.resource_id.endswith("/hgt") for item in nodes)
-            has_video_tab = any(
+            has_category_tab = any(
                 item.bounds[1] < 450
-                and (item.text == "视频" or item.description == "视频")
+                and (item.text == category or item.description == category)
                 for item in nodes
             )
-            if has_search and has_video_tab:
-                if not self._activate_category("视频"):
-                    raise WorkflowError("返回搜索结果后无法重新选择视频分类")
+            if has_search and has_category_tab:
+                if not self._activate_category(category):
+                    raise WorkflowError(f"返回搜索结果后无法重新选择{category}分类")
                 return
             self.device.press("back")
             sleep(0.8)
@@ -451,7 +521,7 @@ class TikTokSearchWorkflow:
         self._emit(
             progress,
             "COLLECT_COMMENTS",
-            f"房间 {room_number}：开始采集评论用户，最多 {max_comments} 条",
+            f"房间 {room_number}：开始采集评论用户，最多 {max_comments} 位",
             self._timed_progress(started_at, deadline)
             if started_at is not None and deadline is not None else 88,
         )
@@ -507,6 +577,7 @@ class TikTokSearchWorkflow:
                         "comment": pending.comment,
                         "keyword": keyword,
                         "room_number": str(room_number),
+                        "mark": "视频",
                     })
                 # Returning from a profile can slightly reposition the list.
                 # Re-dump before touching the next username; never reuse nodes.
@@ -519,6 +590,303 @@ class TikTokSearchWorkflow:
             self.device.swipe(540, 1990, 540, 1210, duration=0.5)
             sleep(1.0)
         return len(collected)
+
+    def _collect_live_rooms(
+        self,
+        progress: ProgressCallback,
+        max_users: int,
+        collection_minutes: float,
+        keyword: str,
+        user_callback: UserCallback | None,
+        room_seen_callback: RoomSeenCallback | None,
+        room_recorded_callback: RoomRecordedCallback | None,
+    ) -> int:
+        started_at = monotonic()
+        deadline = started_at + collection_minutes * 60
+        result_slot = 0
+        room_number = 1
+        rooms_entered = 0
+        total_count = 0
+        empty_result_pages = 0
+        self._emit(
+            progress,
+            "COLLECT_LIVE_USERS",
+            f"开始定时采集直播观众：{collection_minutes:g} 分钟，每个房间最多 {max_users} 位",
+            60,
+        )
+        while monotonic() < deadline:
+            self._check_cancelled()
+            self._emit(
+                progress,
+                "SELECT_CONTENT",
+                f"正在选择第 {room_number} 个直播房间",
+                self._timed_progress(started_at, deadline),
+            )
+            if not self._open_result_at_slot("live", result_slot, timeout=5):
+                empty_result_pages += 1
+                if empty_result_pages >= 3:
+                    break
+                self.device.swipe(540, 2050, 540, 650, duration=0.6)
+                sleep(1.0)
+                result_slot = 0
+                continue
+            empty_result_pages = 0
+            result_slot += 1
+            room_key = self._room_identity("live")
+            if room_seen_callback and room_seen_callback("live", room_key):
+                self._emit(
+                    progress,
+                    "ROOM_SKIPPED",
+                    "该直播间在最近 24 小时内已采集，跳过并继续下一个直播间",
+                    self._timed_progress(started_at, deadline),
+                )
+                self._return_to_search_results("live")
+                continue
+            rooms_entered += 1
+            self._emit(
+                progress,
+                "ROOM_STARTED",
+                f"已进入第 {room_number} 个直播间，正在打开观众排名",
+                self._timed_progress(started_at, deadline),
+            )
+            count = self._collect_live_ranked_users(
+                progress,
+                max_users,
+                deadline=deadline,
+                room_number=room_number,
+                started_at=started_at,
+                keyword=keyword,
+                user_callback=user_callback,
+            )
+            total_count += count
+            if room_recorded_callback:
+                room_recorded_callback(
+                    "live", room_key, keyword, self._last_room_label
+                )
+            self._emit(
+                progress,
+                "ROOM_COMPLETED",
+                f"第 {room_number} 个直播间采集完成：新增 {count} 位；累计 {total_count} 位",
+                self._timed_progress(started_at, deadline),
+            )
+            if monotonic() >= deadline:
+                break
+            self._return_to_search_results("live")
+            room_number += 1
+        self._emit(
+            progress,
+            "COLLECTION_FINISHED",
+            f"直播观众采集结束：共进入 {rooms_entered} 个房间，新增 {total_count} 位用户",
+            100,
+        )
+        return total_count
+
+    def _collect_live_ranked_users(
+        self,
+        progress: ProgressCallback,
+        max_users: int,
+        *,
+        deadline: float,
+        room_number: int,
+        started_at: float,
+        keyword: str,
+        user_callback: UserCallback | None,
+    ) -> int:
+        ranking_entry = None
+        entry_deadline = monotonic() + 10
+        while monotonic() < entry_deadline and monotonic() < deadline:
+            ranking_entry = self._find_first(
+                lambda item: item.clickable and (
+                    item.resource_id.endswith("/psx")
+                    or item.resource_id.endswith("/tv_online_audience_num")
+                    or "次观看" in item.description
+                )
+            )
+            if ranking_entry:
+                break
+            # Live controls auto-hide. A neutral tap restores the overlay
+            # without liking, following, or sending a chat message.
+            width, height = self.device.window_size()
+            self.device.click(width // 2, height // 2)
+            sleep(0.8)
+        if not ranking_entry:
+            self._emit(
+                progress,
+                "ROOM_NO_RANKING",
+                f"房间 {room_number} 当前没有可用的观众排名，继续下一个直播间",
+                self._timed_progress(started_at, deadline),
+            )
+            return 0
+        self.device.click(*ranking_entry.center)
+        panel = self._wait_node(
+            lambda item: item.resource_id.endswith("/rpr"), 10
+        )
+        width, height = self.device.window_size()
+        panel_top = panel.bounds[1]
+        # The list is a custom-rendered view. Select “头号观众”, then open
+        # each visible row to read its accessible profile card.
+        self.device.click(int(width * 0.15), min(height - 1, panel_top + int(height * 0.095)))
+        sleep(0.8)
+        seen_handles: set[str] = set()
+        new_count = 0
+        stagnant_pages = 0
+        previous_page: tuple[str, ...] = ()
+        while new_count < max_users and stagnant_pages < 3 and monotonic() < deadline:
+            page_handles: list[str] = []
+            row_y = panel_top + int(height * 0.16)
+            row_step = max(130, int(height * 0.071))
+            # Process every visible user before scrolling again. The ranking
+            # keeps its position after returning from a full profile; scrolling
+            # before each row would collect only the first user of every page.
+            for index in range(4):
+                if new_count >= max_users or monotonic() >= deadline:
+                    break
+                y = row_y + index * row_step
+                if y >= height - 90:
+                    break
+                profile = self._read_live_rank_profile(int(width * 0.16), y)
+                if not profile or not profile.handle:
+                    continue
+                handle_key = profile.handle.casefold()
+                page_handles.append(handle_key)
+                if handle_key in seen_handles:
+                    continue
+                seen_handles.add(handle_key)
+                record = {
+                    "username": self._single_line(profile.username),
+                    "handle": profile.handle,
+                    "following": profile.following,
+                    "followers": profile.followers,
+                    "likes": profile.likes,
+                    "comment": "",
+                    "keyword": keyword,
+                    "room_number": str(room_number),
+                    "mark": "直播",
+                }
+                created = user_callback(record) if user_callback is not None else True
+                if created is False:
+                    continue
+                new_count += 1
+                self._emit(
+                    progress,
+                    "LIVE_USER_COLLECTED",
+                    f"房间：{room_number} | 用户名：{self._single_line(record['username'])} | "
+                    f"@名字：{profile.handle} | 关注：{profile.following} | "
+                    f"粉丝：{profile.followers} | 赞：{profile.likes}",
+                    self._timed_progress(started_at, deadline),
+                )
+            signature = tuple(page_handles)
+            stagnant_pages = stagnant_pages + 1 if not signature or signature == previous_page else 0
+            previous_page = signature
+            if new_count >= max_users:
+                break
+            self._advance_live_ranking_page(panel_top, width, height)
+        return new_count
+
+    def _advance_live_ranking_page(
+        self, panel_top: int, width: int, height: int
+    ) -> None:
+        """Scroll exactly once after all four visible ranking users are read."""
+        # Move about three row-heights and intentionally keep one overlapping
+        # user visible. Deduplication removes the overlap and prevents users
+        # between two pages from being skipped.
+        start_y = min(height - 170, panel_top + int(height * 0.48))
+        end_y = panel_top + int(height * 0.265)
+        x = int(width * 0.78)
+        self.device.swipe(x, start_y, x, end_y, duration=0.7)
+        sleep(0.8)
+
+    def _read_live_rank_profile(self, x: int, y: int) -> ProfileInfo | None:
+        self.device.click(x, y)
+        opened_profile_layer = False
+        try:
+            card_deadline = monotonic() + 6
+            while monotonic() < card_deadline:
+                self._check_cancelled()
+                nodes = self._nodes()
+                card_handle = next((
+                    item for item in nodes
+                    if item.resource_id.endswith("/user_name") and item.text.strip()
+                ), None)
+                card_name = next((
+                    item for item in nodes
+                    if item.resource_id.endswith("/pdl") and item.text.strip()
+                ), None)
+                avatar = next((
+                    item for item in nodes
+                    if item.resource_id.endswith("/bit") and item.clickable
+                ), None)
+                if card_handle and card_name and avatar:
+                    opened_profile_layer = True
+                    username = card_name.text.strip()
+                    # The first tap only opens a compact LIVE profile card.
+                    # Its counters are incomplete, so tap the avatar again and
+                    # read the real profile page as requested.
+                    self.device.click(*avatar.center)
+                    full_deadline = monotonic() + 10
+                    while monotonic() < full_deadline:
+                        self._check_cancelled()
+                        full_nodes = self._nodes()
+                        full_handle = next((
+                            item.text.strip() for item in full_nodes
+                            if item.resource_id.endswith("/scn")
+                            and self._valid_handle(item.text.strip())
+                        ), "")
+                        if full_handle and any(
+                            item.resource_id.endswith("/sb6") for item in full_nodes
+                        ):
+                            return ProfileInfo(
+                                username=username,
+                                handle=full_handle,
+                                following=self._profile_stat(full_nodes, "关注"),
+                                followers=self._profile_stat(full_nodes, "粉丝"),
+                                likes=self._profile_stat(full_nodes, "赞", "获赞"),
+                            )
+                        sleep(0.4)
+                    return None
+                if any(item.resource_id.endswith("/rpr") for item in nodes):
+                    sleep(0.35)
+                    continue
+                opened_profile_layer = True
+                sleep(0.35)
+            return None
+        finally:
+            if opened_profile_layer:
+                self.device.press("back")
+                try:
+                    self._wait_node(lambda item: item.resource_id.endswith("/rpr"), 6)
+                except WorkflowError:
+                    pass
+                sleep(0.35)
+
+    @staticmethod
+    def _live_stat(value: str, label: str) -> str:
+        match = re.search(rf"([\d.,万亿KkMm]+)\s*{re.escape(label)}", value)
+        return match.group(1) if match else "未知"
+
+    def _room_identity(self, content_type: str) -> str:
+        nodes = self._nodes()
+        values: list[str] = []
+        if self._last_result_hint:
+            values.append(self._last_result_hint)
+        preferred_suffixes = (
+            "/user_name", "/title", "/desc", "/tv_desc", "/b1o", "/scn"
+        )
+        for item in nodes:
+            if item.resource_id.endswith(preferred_suffixes):
+                value = self._single_line(item.text or item.description)
+                if value and value not in values:
+                    values.append(value)
+        if not values:
+            for item in nodes:
+                value = self._single_line(item.text or item.description)
+                if value.startswith("@") and value not in values:
+                    values.append(value)
+        stable_text = "|".join(values[:8]) or f"slot:{self._last_result_hint}"
+        self._last_room_label = stable_text[:240]
+        return hashlib.sha256(
+            f"{content_type}|{stable_text}".encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _visible_comment_entries(nodes: list[UINode]) -> list[CommentEntry]:
@@ -662,7 +1030,11 @@ class TikTokSearchWorkflow:
 
     @staticmethod
     def _single_line(value: str) -> str:
-        return " ".join(value.replace("|", "｜").split())
+        cleaned = "".join(
+            character for character in value.replace("|", "｜")
+            if unicodedata.category(character) not in {"Cc", "Cf"}
+        )
+        return " ".join(cleaned.split())
 
     @staticmethod
     def _looks_like_chat_input(item: UINode) -> bool:

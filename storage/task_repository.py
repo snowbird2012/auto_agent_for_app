@@ -65,6 +65,18 @@ class TaskRepository:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS ix_task_logs_task_id ON task_logs(task_id, id);
+
+                CREATE TABLE IF NOT EXISTS collected_rooms (
+                    content_type TEXT NOT NULL CHECK(content_type IN ('video','live')),
+                    content_key TEXT NOT NULL,
+                    task_id INTEGER REFERENCES automation_tasks(id) ON DELETE CASCADE,
+                    room_title TEXT NOT NULL DEFAULT '',
+                    keyword TEXT NOT NULL DEFAULT '',
+                    last_collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(content_type, content_key)
+                );
+                CREATE INDEX IF NOT EXISTS ix_collected_rooms_time
+                    ON collected_rooms(last_collected_at);
                 """
             )
             columns = {
@@ -78,6 +90,30 @@ class TaskRepository:
                 db.execute(
                     "ALTER TABLE automation_tasks ADD COLUMN collection_minutes INTEGER NOT NULL DEFAULT 2"
                 )
+            room_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(collected_rooms)").fetchall()
+            }
+            if "task_id" not in room_columns:
+                db.execute(
+                    "ALTER TABLE collected_rooms ADD COLUMN task_id INTEGER REFERENCES automation_tasks(id) ON DELETE CASCADE"
+                )
+            if "room_title" not in room_columns:
+                db.execute(
+                    "ALTER TABLE collected_rooms ADD COLUMN room_title TEXT NOT NULL DEFAULT ''"
+                )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS ix_collected_rooms_task ON collected_rooms(task_id,last_collected_at)"
+            )
+            # Associate records created before task ownership was introduced
+            # with the newest matching task, so they remain visible in the UI.
+            db.execute(
+                """UPDATE collected_rooms AS room SET task_id=(
+                    SELECT task.id FROM automation_tasks AS task
+                    WHERE (task.content_type=room.content_type OR task.content_type='either')
+                    AND task.keywords_json LIKE '%' || room.keyword || '%'
+                    ORDER BY task.id DESC LIMIT 1
+                ) WHERE room.task_id IS NULL"""
+            )
 
     def create_task(self, values: dict[str, Any]) -> int:
         name = str(values.get("name", "")).strip()
@@ -163,3 +199,109 @@ class TaskRepository:
             if row and row["status"] == "running":
                 raise ValueError("运行中的任务不能删除")
             db.execute("DELETE FROM automation_tasks WHERE id=?", (task_id,))
+
+    def was_room_collected_recently(
+        self, content_type: str, content_key: str, hours: int = 24
+    ) -> bool:
+        """Return whether this content was successfully collected in the window."""
+        if content_type not in {"video", "live"} or not content_key.strip():
+            return False
+        hours = max(1, min(24 * 365, int(hours)))
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM collected_rooms
+                WHERE content_type=? AND content_key=?
+                AND last_collected_at >= datetime('now', ?)""",
+                (content_type, content_key.strip(), f"-{hours} hours"),
+            ).fetchone()
+        return row is not None
+
+    def record_room_collected(
+        self,
+        content_type: str,
+        content_key: str,
+        keyword: str = "",
+        room_title: str = "",
+        task_id: int | None = None,
+    ) -> None:
+        if content_type not in {"video", "live"} or not content_key.strip():
+            return
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO collected_rooms
+                (content_type,content_key,task_id,room_title,keyword,last_collected_at)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(content_type,content_key) DO UPDATE SET
+                    task_id=excluded.task_id,
+                    room_title=excluded.room_title,
+                    keyword=excluded.keyword,
+                    last_collected_at=CURRENT_TIMESTAMP""",
+                (
+                    content_type,
+                    content_key.strip(),
+                    task_id,
+                    room_title.strip(),
+                    keyword.strip(),
+                ),
+            )
+
+    def list_collected_rooms(self, task_id: int) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT rowid AS id,content_type,content_key,task_id,
+                room_title,keyword,last_collected_at
+                FROM collected_rooms WHERE task_id=?
+                ORDER BY last_collected_at DESC,rowid DESC""",
+                (int(task_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_collected_rooms(self, room_ids: list[int], task_id: int) -> int:
+        ids = sorted({int(item) for item in room_ids})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as db:
+            cursor = db.execute(
+                f"DELETE FROM collected_rooms WHERE task_id=? AND rowid IN ({placeholders})",
+                [int(task_id), *ids],
+            )
+            return int(cursor.rowcount)
+
+    def dashboard_task_data(
+        self, start_utc: str, end_utc: str, activity_limit: int = 6
+    ) -> dict[str, Any]:
+        """Return real task/room counters and latest persisted task events."""
+        with self._connect() as db:
+            status_rows = db.execute(
+                "SELECT status,COUNT(*) AS count FROM automation_tasks GROUP BY status"
+            ).fetchall()
+            finished_rows = db.execute(
+                """SELECT status,COUNT(*) AS count FROM automation_tasks
+                WHERE finished_at>=? AND finished_at<? GROUP BY status""",
+                (start_utc, end_utc),
+            ).fetchall()
+            room_rows = db.execute(
+                """SELECT content_type,COUNT(*) AS count FROM collected_rooms
+                WHERE last_collected_at>=? AND last_collected_at<?
+                GROUP BY content_type""",
+                (start_utc, end_utc),
+            ).fetchall()
+            activities = db.execute(
+                """SELECT log.level,log.step,log.message,log.created_at,
+                task.id AS task_id,task.name AS task_name
+                FROM task_logs AS log
+                JOIN automation_tasks AS task ON task.id=log.task_id
+                ORDER BY log.id DESC LIMIT ?""",
+                (max(1, min(30, int(activity_limit))),),
+            ).fetchall()
+        return {
+            "statuses": {row["status"]: int(row["count"]) for row in status_rows},
+            "finished_today": {
+                row["status"]: int(row["count"]) for row in finished_rows
+            },
+            "rooms_today": {
+                row["content_type"]: int(row["count"]) for row in room_rows
+            },
+            "activities": [dict(row) for row in activities],
+        }
