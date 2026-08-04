@@ -38,11 +38,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from storage import AutomationJobRepository, ConversationRepository, MessageStrategyRepository
 from storage.settings_repository import SettingsRepository
 from storage.task_repository import TaskRepository
 from storage.user_repository import UserRepository
 from devices import ADBClient, AndroidDevice
 from ui.ai_settings_widget import AISettingsWidget
+from ui.automation_tasks_widget import AutomationTasksWidget
+from ui.message_strategy_widget import MessageStrategyWidget
+from ui.message_management_widget import MessageManagementWidget
 from ui.device_management_widget import DeviceManagementWidget
 from ui.proxy_settings_widget import ProxySettingsWidget
 from ui.task_center_widget import TaskCenterWidget
@@ -54,9 +58,11 @@ from utils.time_utils import COMMON_TIMEZONES, format_utc_timestamp
 NAV_ITEMS = [
     "运营总览",
     "设备管理",
-    "任务中心",
+    "用户采集",
     "用户管理",
-    "联系人",
+    "自动化任务",
+    "消息策略",
+    "消息管理",
     "审核中心",
     "系统设置",
 ]
@@ -70,6 +76,11 @@ class MainWindow(QMainWindow):
         self.settings_repository = settings_repository or SettingsRepository()
         self.task_repository = TaskRepository(self.settings_repository.database_path)
         self.user_repository = UserRepository(self.settings_repository.database_path)
+        self.automation_job_repository = AutomationJobRepository(
+            self.settings_repository.database_path
+        )
+        self.message_strategy_repository = MessageStrategyRepository(self.settings_repository.database_path)
+        self.conversation_repository = ConversationRepository(self.settings_repository.database_path)
         self.adb_client = ADBClient()
         self.setWindowTitle("AutoAgent · Android")
         self.resize(1480, 900)
@@ -111,7 +122,20 @@ class MainWindow(QMainWindow):
         )
         self.task_page.users_updated.connect(self.user_page.refresh_users)
         self.pages.addWidget(self._scroll_page(self.user_page))
-        self.pages.addWidget(self._contacts_page())
+        self.automation_page = AutomationTasksWidget(
+            self.automation_job_repository,
+            self.user_repository,
+            self.settings_repository,
+            self.adb_client,
+            self.message_strategy_repository,
+            self.conversation_repository,
+        )
+        self.pages.addWidget(self._scroll_page(self.automation_page))
+        self.message_strategy_page = MessageStrategyWidget(self.message_strategy_repository,self.settings_repository)
+        self.pages.addWidget(self._scroll_page(self.message_strategy_page))
+        self.message_page = MessageManagementWidget(self.conversation_repository,self.settings_repository)
+        self.automation_page.messages_updated.connect(self.message_page.refresh)
+        self.pages.addWidget(self._scroll_page(self.message_page))
         self.pages.addWidget(self._scroll_page(self._review_page()))
         self.pages.addWidget(self._scroll_page(self._settings_page()))
         content_layout.addWidget(self.pages, 1)
@@ -172,7 +196,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(breadcrumb)
         layout.addStretch()
         search = QLineEdit()
-        search.setPlaceholderText("搜索联系人、任务或设备...")
+        search.setPlaceholderText("搜索用户、任务或设备...")
         search.setFixedWidth(270)
         layout.addWidget(search)
         self.dashboard_notice = QPushButton("暂无失败任务")
@@ -192,6 +216,12 @@ class MainWindow(QMainWindow):
         self.breadcrumb.setText(f"工作台  /  {NAV_ITEMS[index]}")
         if index == 0 and hasattr(self, "dashboard_metrics"):
             self._refresh_dashboard_data()
+        elif index == 4 and hasattr(self, "automation_page"):
+            self.automation_page.refresh_all()
+        elif index == 5 and hasattr(self, "message_strategy_page"):
+            self.message_strategy_page.refresh_all()
+        elif index == 6 and hasattr(self, "message_page"):
+            self.message_page.refresh()
 
     @staticmethod
     def _scroll_page(content: QWidget) -> QScrollArea:
@@ -390,7 +420,7 @@ class MainWindow(QMainWindow):
     def _contacts_page(self) -> QWidget:
         page, layout = self._page()
         header = QHBoxLayout()
-        header.addWidget(SectionHeader("联系人与私信", "查看已发现用户、关注状态和完整会话记录"))
+        header.addWidget(SectionHeader("消息管理", "查看联系人及其完整私信记录"))
         header.addStretch()
         export = QPushButton("导出联系人")
         export.clicked.connect(lambda: self._info("导出", "UI 原型暂不写出文件。"))
@@ -661,6 +691,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.task_page.shutdown()
         self.user_page.shutdown()
+        self.automation_page.shutdown()
         for worker in list(self.task_page.workers.values()):
             worker.wait(3_000)
         if self.user_page.intent_worker:

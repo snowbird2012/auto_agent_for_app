@@ -51,6 +51,8 @@ class UserRepository:
                     likes TEXT NOT NULL DEFAULT '未知',
                     mark TEXT NOT NULL DEFAULT '视频'
                         CHECK(mark IN ('视频','直播','意向')),
+                    first_message_sent INTEGER NOT NULL DEFAULT 0
+                        CHECK(first_message_sent IN (0,1)),
                     tags_json TEXT NOT NULL DEFAULT '[]',
                     first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -69,6 +71,15 @@ class UserRepository:
                 CREATE INDEX IF NOT EXISTS ix_temporary_comments_user ON temporary_user_comments(user_id, id);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(temporary_users)").fetchall()
+            }
+            if "first_message_sent" not in columns:
+                db.execute(
+                    "ALTER TABLE temporary_users "
+                    "ADD COLUMN first_message_sent INTEGER NOT NULL DEFAULT 0"
+                )
             db.execute("DELETE FROM temporary_users WHERE handle_key IN ('', '@')")
 
     @staticmethod
@@ -234,6 +245,7 @@ class UserRepository:
         result = []
         for row in rows:
             item = dict(row)
+            item["first_message_sent"] = bool(item.get("first_message_sent", 0))
             item["tags"] = self._tags(item.pop("tags_json"))
             result.append(item)
         return result, total
@@ -341,3 +353,26 @@ class UserRepository:
             "total": total,
             "first_seen_at": [str(row["first_seen_at"]) for row in rows],
         }
+
+    def list_tags(self) -> list[str]:
+        """Return all distinct persisted user tags in display order."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT tags_json FROM temporary_users ORDER BY id"
+            ).fetchall()
+        result: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            for tag in self._tags(row["tags_json"]):
+                key = tag.casefold()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(tag)
+        return result
+
+    def mark_first_message_sent(self, user_id: int, sent: bool = True) -> None:
+        with self._connect() as db:
+            db.execute(
+                "UPDATE temporary_users SET first_message_sent=? WHERE id=?",
+                (1 if sent else 0, int(user_id)),
+            )

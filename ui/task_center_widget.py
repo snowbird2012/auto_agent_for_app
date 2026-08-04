@@ -160,8 +160,8 @@ class TaskCenterWidget(QWidget):
 
         header = QHBoxLayout()
         header.addWidget(SectionHeader(
-            "任务中心",
-            "创建真实 TikTok 搜索任务：进入视频评论区或直播聊天区后停止",
+            "用户采集",
+            "创建并执行真实 TikTok 视频评论用户或直播观众采集任务",
         ))
         header.addStretch()
         self.refresh_button = QPushButton("刷新任务")

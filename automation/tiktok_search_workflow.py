@@ -1084,7 +1084,8 @@ class TikTokSearchWorkflow:
             container_key = ""
             parent = parents.get(element)
             while parent is not None:
-                if parent.attrib.get("resource-id", "").endswith("/etr"):
+                parent_resource = parent.attrib.get("resource-id", "")
+                if parent_resource.endswith(("/etr", "/t70")):
                     container_key = parent.attrib.get("bounds", "")
                     break
                 parent = parents.get(parent)

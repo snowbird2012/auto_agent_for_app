@@ -80,6 +80,10 @@ QPushButton:pressed { background: #101c30; }
 QPushButton#Primary { background: #2563eb; border-color: #3476f4; color: white; font-weight: 600; }
 QPushButton#Primary:hover { background: #3473ee; }
 QPushButton#DangerButton { color: #fb7185; border-color: #713247; background: #281722; }
+QPushButton#DebugStopButton {
+    color: white; border-color: #ef4444; background: #dc2626; font-weight: 600;
+}
+QPushButton#DebugStopButton:hover { background: #ef4444; border-color: #f87171; }
 QPushButton#CompactActionButton, QPushButton#CompactDangerButton {
     min-height: 18px; max-height: 22px; padding: 0px 4px; margin: 0px;
     border-radius: 5px; font-size: 11px;
@@ -168,5 +172,34 @@ QListWidget {
 }
 QListWidget::item { padding: 12px; border-bottom: 1px solid #19283d; }
 QListWidget::item:selected { background: #17345e; border-radius: 8px; }
+QListWidget#MessageContactList::item {
+    padding: 11px 12px; border-bottom: 1px solid #19283d;
+}
+QWidget#ChatHeader {
+    background: #101e32; border-bottom: 1px solid #22344d;
+    border-top-left-radius: 11px; border-top-right-radius: 11px;
+}
+QScrollArea#ChatHistory, QWidget#ChatCanvas, QWidget#ChatMessageRow {
+    background: #091422;
+}
+QFrame#IncomingBubble {
+    background: #17263a; border: 1px solid #263a55;
+    border-radius: 12px;
+}
+QFrame#OutgoingBubble {
+    background: #245cc4; border: 1px solid #3476e6;
+    border-radius: 12px;
+}
+QFrame#IncomingBubble QLabel#ChatMessageText,
+QFrame#OutgoingBubble QLabel#ChatMessageText {
+    color: #f1f5fb; background: transparent; font-size: 13px;
+}
+QFrame#IncomingBubble QLabel#ChatMessageMeta {
+    color: #8293aa; background: transparent; font-size: 10px;
+}
+QFrame#OutgoingBubble QLabel#ChatMessageMeta {
+    color: #c5d8ff; background: transparent; font-size: 10px;
+}
+QLabel#ChatEmpty { color: #718198; background: transparent; }
 QToolTip { background: #182842; color: white; border: 1px solid #38506f; padding: 5px; }
 """

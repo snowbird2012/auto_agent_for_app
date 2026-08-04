@@ -155,11 +155,11 @@ class UserManagementWidget(QWidget):
         layout.addWidget(filters)
 
         table_card, table_layout = card_layout()
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setObjectName("UserManagementTable")
         self.table.setHorizontalHeaderLabels([
             "用户名", "@名字", "标记", "关注", "粉丝", "赞", "留言数",
-            "用户标签", "最近采集", "操作",
+            "首次消息", "用户标签", "最近采集", "操作",
         ])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -171,11 +171,11 @@ class UserManagementWidget(QWidget):
         header_view.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
-        header_view.resizeSection(8, 180)
+        header_view.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         header_view.setSectionResizeMode(9, QHeaderView.ResizeMode.Fixed)
-        header_view.resizeSection(9, 128)
+        header_view.resizeSection(9, 180)
+        header_view.setSectionResizeMode(10, QHeaderView.ResizeMode.Fixed)
+        header_view.resizeSection(10, 128)
         self.table.verticalHeader().setDefaultSectionSize(40)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.table.setMinimumHeight(360)
@@ -250,7 +250,8 @@ class UserManagementWidget(QWidget):
             values = [
                 user["username"], user["handle"], user["mark"],
                 user["following"], user["followers"], user["likes"],
-                str(user["comment_count"]), "",
+                str(user["comment_count"]),
+                "是" if user["first_message_sent"] else "否", "",
                 recent_text,
                 "",
             ]
@@ -266,16 +267,16 @@ class UserManagementWidget(QWidget):
                     }
                     item.setForeground(colors.get(str(value), Qt.GlobalColor.white))
                 self.table.setItem(row, column, item)
-            self.table.setCellWidget(row, 7, self._tag_widget(user["tags"]))
+            self.table.setCellWidget(row, 8, self._tag_widget(user["tags"]))
             self.table.setCellWidget(
-                row, 9, self._operation_widget(int(user["id"]), user["mark"])
+                row, 10, self._operation_widget(int(user["id"]), user["mark"])
             )
             self.table.setRowHeight(row, 40)
             recent_column_width = max(
                 recent_column_width,
                 cell_metrics.horizontalAdvance(recent_text) + 18,
             )
-        self.table.horizontalHeader().resizeSection(8, recent_column_width)
+        self.table.horizontalHeader().resizeSection(9, recent_column_width)
         self.total_label.setText(f"共 {self.total} 位用户")
         self.page_label.setText(f"第 {self.page} / {page_count} 页 · 每页 {self.PAGE_SIZE} 条")
         self.prev_button.setEnabled(self.page > 1)
