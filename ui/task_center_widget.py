@@ -69,6 +69,7 @@ class TaskExecutionWorker(QThread):
     failed = Signal(int, str)
     cancelled = Signal(int, str)
     user_collected = Signal(int, object)
+    room_recorded = Signal(int, str, str)
 
     def __init__(
         self,
@@ -112,8 +113,8 @@ class TaskExecutionWorker(QThread):
                 room_seen_callback=lambda kind, key: self.task_repository.was_room_collected_recently(
                     kind, key, 24
                 ),
-                room_recorded_callback=lambda kind, key, search_keyword, title: self.task_repository.record_room_collected(
-                    kind, key, search_keyword, title, task_id
+                room_recorded_callback=lambda kind, key, search_keyword, title: self._record_room(
+                    task_id, kind, key, search_keyword, title
                 ),
             )
             self.succeeded.emit(task_id, chosen_type)
@@ -129,6 +130,21 @@ class TaskExecutionWorker(QThread):
         if user_id is not None:
             self.user_collected.emit(task_id, record)
         return created
+
+    def _record_room(
+        self,
+        task_id: int,
+        kind: str,
+        key: str,
+        search_keyword: str,
+        title: str,
+    ) -> None:
+        # Emit only after the repository transaction has committed so the UI
+        # can query and display the new row immediately.
+        self.task_repository.record_room_collected(
+            kind, key, search_keyword, title, task_id
+        )
+        self.room_recorded.emit(task_id, kind, title)
 
 
 class TaskCenterWidget(QWidget):
@@ -272,7 +288,8 @@ class TaskCenterWidget(QWidget):
         detail_splitter = QSplitter(Qt.Orientation.Horizontal)
         rooms_card, rooms_layout = card_layout()
         rooms_header = QHBoxLayout()
-        rooms_header.addWidget(label("已采集房间", "SectionTitle"))
+        self.rooms_title = label("已采集房间 (0)", "SectionTitle")
+        rooms_header.addWidget(self.rooms_title)
         rooms_header.addStretch()
         select_rooms = QPushButton("全选")
         select_rooms.clicked.connect(self._select_all_rooms)
@@ -315,7 +332,7 @@ class TaskCenterWidget(QWidget):
 
     def update_devices(self, devices: list[AndroidDevice]) -> None:
         current = self.device_combo.currentData()
-        authorized = [item for item in devices if item.authorized]
+        authorized = [item for item in devices if item.automation_ready]
         self.devices = {item.serial: item for item in authorized}
         self.device_combo.clear()
         if not authorized:
@@ -401,6 +418,7 @@ class TaskCenterWidget(QWidget):
         if not task:
             self.log_view.clear()
             self.rooms_table.setRowCount(0)
+            self.rooms_title.setText("已采集房间 (0)")
             self.delete_rooms_button.setEnabled(False)
             self.current_progress.setValue(0)
             self.start_button.setEnabled(False)
@@ -432,6 +450,7 @@ class TaskCenterWidget(QWidget):
 
     def _refresh_collected_rooms(self, task_id: int) -> None:
         rooms = self.repository.list_collected_rooms(task_id)
+        self.rooms_title.setText(f"已采集房间 ({len(rooms)})")
         timezone_name = (
             self.settings_repository.get_timezone()
             if self.settings_repository is not None else None
@@ -516,6 +535,7 @@ class TaskCenterWidget(QWidget):
         worker.failed.connect(self._task_failed)
         worker.cancelled.connect(self._task_cancelled)
         worker.user_collected.connect(self._user_collected)
+        worker.room_recorded.connect(self._room_recorded)
         worker.finished.connect(lambda task_id=task_id: self._worker_finished(task_id))
         self.workers[task_id] = worker
         self.refresh_tasks(select_task_id=task_id)
@@ -552,6 +572,12 @@ class TaskCenterWidget(QWidget):
 
     def _user_collected(self, task_id: int, record: dict) -> None:
         self.users_updated.emit()
+
+    def _room_recorded(self, task_id: int, kind: str, title: str) -> None:
+        # Do not change the user's current task selection. If the recorded room
+        # belongs to the task being viewed, update the left pane immediately.
+        if self.selected_task_id() == task_id:
+            self._refresh_collected_rooms(task_id)
 
     def _task_succeeded(self, task_id: int, chosen_type: str) -> None:
         type_text = "直播" if chosen_type == "live" else "视频"

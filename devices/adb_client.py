@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from typing import Iterable
 
 import cv2
@@ -38,11 +39,17 @@ class AndroidDevice:
     battery_status: str = ""
     foreground_package: str = ""
     connection_type: str = "USB"
+    uiautomator2_initialized: bool | None = None
+    uiautomator2_error: str = ""
     error: str = ""
 
     @property
     def authorized(self) -> bool:
         return self.state == "device"
+
+    @property
+    def automation_ready(self) -> bool:
+        return self.authorized and self.uiautomator2_initialized is True
 
     @property
     def display_name(self) -> str:
@@ -122,6 +129,7 @@ class ADBClient:
         battery_text = self.shell(serial, ["dumpsys", "battery"], timeout=10)
         size_text = self.shell(serial, ["wm", "size"], timeout=10)
         activity_text = self.shell(serial, ["dumpsys", "activity", "activities"], timeout=12)
+        uiautomator2_initialized, uiautomator2_error = self.check_uiautomator2(serial)
         battery_level, battery_status = self.parse_battery(battery_text)
         model = properties.get("ro.product.model", "") or base.model
         return replace(
@@ -136,7 +144,51 @@ class ADBClient:
             battery_level=battery_level,
             battery_status=battery_status,
             foreground_package=self.parse_foreground_package(activity_text),
+            uiautomator2_initialized=uiautomator2_initialized,
+            uiautomator2_error=uiautomator2_error,
         )
+
+    def check_uiautomator2(self, serial: str) -> tuple[bool, str]:
+        """Verify that uiautomator2 assets exist and its device service responds."""
+        try:
+            marker = self.shell(serial, ["ls", "/data/local/tmp/u2.jar"], timeout=6)
+            if not marker.strip().endswith("/u2.jar"):
+                return False, "未发现 uiautomator2 设备端文件"
+            import uiautomator2 as u2
+
+            device = u2.connect(serial)
+            info = device.info
+            if not isinstance(info, dict):
+                return False, "uiautomator2 服务未返回设备信息"
+            return True, ""
+        except Exception as error:
+            return False, str(error)
+
+    def initialize_uiautomator2(self, serial: str) -> None:
+        """Install uiautomator2 assets using the current Python environment."""
+        command = [sys.executable, "-m", "uiautomator2", "-s", serial, "init"]
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=False,
+                creationflags=creationflags,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ADBError("uiautomator2 初始化超时") from error
+        except OSError as error:
+            raise ADBError(f"无法执行 uiautomator2 初始化：{error}") from error
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout).strip()
+            raise ADBError(message or "uiautomator2 初始化失败")
+        initialized, error = self.check_uiautomator2(serial)
+        if not initialized:
+            raise ADBError(error or "初始化完成后 uiautomator2 服务仍不可用")
 
     @staticmethod
     def parse_getprop(output: str) -> dict[str, str]:

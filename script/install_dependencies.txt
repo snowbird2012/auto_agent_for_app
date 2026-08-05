@@ -1,0 +1,20 @@
+两种方式安装:
+一 直接使用本地python
+python -m pip install --upgrade pip
+python -m pip install --upgrade -r requirements-ui.txt
+
+
+二 使用conda或miniconda如下
+conda create -n py314_opencv python=3.14.2 -y
+conda activate py314_opencv
+python -m pip install --upgrade pip
+python -m pip install --upgrade -r requirements-ui.txt
+
+安装完成后，验证依赖是否安装成功
+python -c "import cv2, numpy, PySide6, requests, uiautomator2; print('依赖安装成功'); print('OpenCV:', cv2.__version__); print('NumPy:', numpy.__version__); print('PySide6:', PySide6.__version__); print('Requests:', requests.__version__)"
+
+
+启动程序
+python main.py
+
+

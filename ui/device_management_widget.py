@@ -6,7 +6,7 @@ from functools import partial
 
 import cv2
 from PySide6.QtCore import QSize, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -26,12 +26,53 @@ from devices import ADBClient, ADBError, AndroidDevice
 from ui.widgets import SectionHeader, card_layout, label
 
 
-STATE_LABELS = {
-    "device": "已连接",
-    "unauthorized": "未授权",
-    "offline": "离线",
-    "no permissions": "无权限",
-}
+def device_setup_status(
+    device: AndroidDevice, initializing: bool = False
+) -> tuple[str, str, str, bool]:
+    """Return headline, instruction, color and whether initialization is clickable."""
+    if initializing:
+        return (
+            "正在初始化",
+            "正在安装并检查 uiautomator2，请保持手机解锁和 USB 连接",
+            "#7db4ff",
+            False,
+        )
+    if device.state == "unauthorized":
+        return (
+            "USB调试未授权",
+            "USB 调试已开启，请解锁手机并点击“允许 USB 调试”",
+            "#f5c46f",
+            False,
+        )
+    if device.state == "offline":
+        return (
+            "USB调试未授权",
+            "设备当前离线，请重新连接 USB，必要时重启 ADB",
+            "#fb7185",
+            False,
+        )
+    if device.state == "no permissions":
+        return (
+            "USB调试未授权",
+            "请检查手机驱动和当前 Windows 用户权限",
+            "#fb7185",
+            False,
+        )
+    if device.state != "device":
+        return (
+            "USB调试未授权",
+            "请开启 USB 调试并重新连接手机",
+            "#fb7185",
+            False,
+        )
+    if device.uiautomator2_initialized is True:
+        return "已就绪", "USB 调试已授权 · uiautomator2 运行正常", "#54e0ac", False
+    return (
+        "未初始化",
+        "USB 调试已授权 · 点击“未初始化”安装 uiautomator2",
+        "#fb7185",
+        True,
+    )
 
 
 class DeviceScanWorker(QThread):
@@ -86,6 +127,9 @@ class DeviceActionWorker(QThread):
             elif self.action == "stop_tiktok":
                 self.client.force_stop_app(self.serial)
                 message = "已停止 TikTok"
+            elif self.action == "init_uiautomator2":
+                self.client.initialize_uiautomator2(self.serial)
+                message = "uiautomator2 初始化完成"
             else:
                 raise ADBError(f"未知设备操作：{self.action}")
             self.succeeded.emit(self.serial, message)
@@ -155,8 +199,14 @@ class DeviceManagementWidget(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        device_header = self.table.horizontalHeader()
+        device_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        device_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        device_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        device_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        device_header.resizeSection(6, 130)
         self.table.itemSelectionChanged.connect(self._selection_changed)
+        self.table.cellClicked.connect(self._status_cell_clicked)
         self.table.setMinimumHeight(220)
         layout.addWidget(self.table)
 
@@ -221,6 +271,8 @@ class DeviceManagementWidget(QWidget):
     def scan_devices(self) -> None:
         if self.scan_worker and self.scan_worker.isRunning():
             return
+        if self.action_worker and self.action_worker.action == "init_uiautomator2":
+            return
         self.scan_button.setEnabled(False)
         self.scan_button.setText("扫描中…")
         self.scan_status.setText("正在查询 ADB 设备和系统信息…")
@@ -270,23 +322,34 @@ class DeviceManagementWidget(QWidget):
         self.table.setRowCount(len(devices))
         for row, device in enumerate(devices):
             battery = f"{device.battery_level}%" if device.battery_level is not None else "—"
+            initializing = bool(
+                self.action_worker
+                and self.action_worker.action == "init_uiautomator2"
+                and self.action_worker.serial == device.serial
+            )
+            headline, detail, color, clickable = device_setup_status(
+                device, initializing
+            )
             values = [
                 device.display_name, device.serial,
                 device.android_version or "—", device.resolution or "—",
                 battery, device.foreground_package or "—",
-                STATE_LABELS.get(device.state, device.state),
+                headline,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, device.serial)
                 if column == 6:
-                    if device.state == "device":
-                        item.setForeground(Qt.GlobalColor.green)
-                    elif device.state == "unauthorized":
-                        item.setForeground(Qt.GlobalColor.yellow)
-                    else:
-                        item.setForeground(Qt.GlobalColor.red)
+                    item.setForeground(QColor(color))
+                    item.setToolTip(
+                        detail + (f"\n检测信息：{device.uiautomator2_error}" if device.uiautomator2_error else "")
+                    )
+                    item.setData(Qt.ItemDataRole.UserRole, "initialize" if clickable else "")
+                    if clickable:
+                        font = item.font()
+                        font.setUnderline(True)
+                        item.setFont(font)
                 self.table.setItem(row, column, item)
             self.table.setRowHeight(row, 46)
         self.table.blockSignals(False)
@@ -306,9 +369,21 @@ class DeviceManagementWidget(QWidget):
 
     def _show_device(self, device: AndroidDevice) -> None:
         self.detail_title.setText(f"设备详情 · {device.display_name}")
-        state = STATE_LABELS.get(device.state, device.state)
+        initializing = bool(
+            self.action_worker
+            and self.action_worker.action == "init_uiautomator2"
+            and self.action_worker.serial == device.serial
+        )
+        state, instruction, _color, _clickable = device_setup_status(
+            device, initializing
+        )
         self.detail_state.setText(state)
-        self.detail_state.setObjectName("PillGreen" if device.authorized else "PillOrange")
+        self.detail_state.setObjectName(
+            "PillBlue" if initializing else
+            ("PillGreen" if device.automation_ready else
+            ("PillOrange" if device.state == "unauthorized" else "PillRed")
+            )
+        )
         self.detail_state.style().unpolish(self.detail_state)
         self.detail_state.style().polish(self.detail_state)
         battery = "—" if device.battery_level is None else f"{device.battery_level}% · {device.battery_status}"
@@ -326,7 +401,44 @@ class DeviceManagementWidget(QWidget):
             self.detail_values[key].setText(value)
         for button in (self.screenshot_button, self.home_button, self.start_button, self.stop_button):
             button.setEnabled(device.authorized and self.action_worker is None)
-        self.action_status.setText(device.error or ("ADB 调试连接正常" if device.authorized else "请在手机上确认 USB 调试授权"))
+        diagnostic = device.error or device.uiautomator2_error
+        self.action_status.setText(
+            instruction + (f"\n检测信息：{diagnostic}" if diagnostic else "")
+        )
+
+    def _status_cell_clicked(self, row: int, column: int) -> None:
+        if column != 6 or self.action_worker is not None:
+            return
+        status_item = self.table.item(row, column)
+        serial_item = self.table.item(row, 0)
+        if (
+            not status_item
+            or status_item.data(Qt.ItemDataRole.UserRole) != "initialize"
+            or not serial_item
+        ):
+            return
+        serial = str(serial_item.data(Qt.ItemDataRole.UserRole) or "")
+        device = self.devices.get(serial)
+        if not device or not device.authorized or device.uiautomator2_initialized is True:
+            return
+        answer = QMessageBox.question(
+            self,
+            "初始化设备",
+            f"是否在设备 {device.display_name}（{serial}）上初始化 uiautomator2？\n\n"
+            "初始化期间请保持手机解锁和 USB 连接。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._select_serial(serial)
+        status_item.setText("正在初始化")
+        status_item.setToolTip("正在安装并检查 uiautomator2，请保持手机解锁和 USB 连接")
+        status_item.setData(Qt.ItemDataRole.UserRole, "")
+        font = status_item.font()
+        font.setUnderline(False)
+        status_item.setFont(font)
+        self.run_action("init_uiautomator2")
 
     def _show_empty_detail(self, message: str) -> None:
         self.detail_title.setText("设备详情")
@@ -384,11 +496,19 @@ class DeviceManagementWidget(QWidget):
         device = self.devices.get(serial or "")
         if not device or not device.authorized or (self.action_worker and self.action_worker.isRunning()):
             return
-        for button in (self.home_button, self.start_button, self.stop_button):
+        for button in (self.screenshot_button, self.home_button, self.start_button, self.stop_button):
             button.setEnabled(False)
         self.action_status.setText("正在执行设备操作…")
         worker = DeviceActionWorker(self.client, serial, action)
         self.action_worker = worker
+        if action == "init_uiautomator2":
+            self.detail_state.setText("正在初始化")
+            self.detail_state.setObjectName("PillBlue")
+            self.detail_state.style().unpolish(self.detail_state)
+            self.detail_state.style().polish(self.detail_state)
+            self.action_status.setText(
+                "正在安装并检查 uiautomator2，请保持手机解锁和 USB 连接"
+            )
         worker.succeeded.connect(self._action_succeeded)
         worker.failed.connect(self._action_failed)
         worker.finished.connect(self._action_finished)
@@ -409,9 +529,11 @@ class DeviceManagementWidget(QWidget):
         worker = self.action_worker
         self.action_worker = None
         device = self.devices.get(self.selected_serial or "")
-        for button in (self.home_button, self.start_button, self.stop_button):
+        for button in (self.screenshot_button, self.home_button, self.start_button, self.stop_button):
             button.setEnabled(bool(device and device.authorized))
         if worker:
+            if worker.action == "init_uiautomator2":
+                QTimer.singleShot(0, self.scan_devices)
             worker.deleteLater()
 
     def _select_serial(self, serial: str) -> None:

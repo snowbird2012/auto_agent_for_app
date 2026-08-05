@@ -259,12 +259,6 @@ class UserRepository:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def update_mark(self, user_id: int, mark: str) -> None:
-        if mark not in {"视频", "直播", "意向"}:
-            raise ValueError("标记只能是视频、直播或意向")
-        with self._connect() as db:
-            db.execute("UPDATE temporary_users SET mark=? WHERE id=?", (mark, user_id))
-
     def delete_users(self, user_ids: list[int]) -> int:
         ids = sorted({int(item) for item in user_ids})
         if not ids:
@@ -275,68 +269,6 @@ class UserRepository:
                 f"DELETE FROM temporary_users WHERE id IN ({placeholders})", ids
             )
             return int(cursor.rowcount)
-
-    def update_users_mark(self, user_ids: list[int], mark: str) -> int:
-        if mark not in {"视频", "直播", "意向"}:
-            raise ValueError("标记只能是视频、直播或意向")
-        ids = sorted({int(item) for item in user_ids})
-        if not ids:
-            return 0
-        placeholders = ",".join("?" for _ in ids)
-        with self._connect() as db:
-            cursor = db.execute(
-                f"UPDATE temporary_users SET mark=? WHERE id IN ({placeholders})",
-                [mark, *ids],
-            )
-            return int(cursor.rowcount)
-
-    def list_collected_users_for_intent(self) -> list[dict[str, Any]]:
-        with self._connect() as db:
-            rows = db.execute(
-                "SELECT * FROM temporary_users WHERE mark IN ('视频','直播') ORDER BY id"
-            ).fetchall()
-            result: list[dict[str, Any]] = []
-            for row in rows:
-                user = dict(row)
-                user["tags"] = self._tags(user.pop("tags_json"))
-                comments = db.execute(
-                    """SELECT keyword,comment,collected_at FROM temporary_user_comments
-                    WHERE user_id=? ORDER BY id""",
-                    (user["id"],),
-                ).fetchall()
-                user["comments"] = [dict(item) for item in comments]
-                result.append(user)
-        return result
-
-    def apply_intent_results(
-        self,
-        intent_user_ids: list[int],
-        non_intent_user_ids: list[int],
-    ) -> tuple[int, int]:
-        intent_ids = sorted({int(item) for item in intent_user_ids})
-        non_intent_ids = sorted({int(item) for item in non_intent_user_ids})
-        if set(intent_ids) & set(non_intent_ids):
-            raise ValueError("意向与非意向用户集合不能重叠")
-        with self._connect() as db:
-            kept = 0
-            deleted = 0
-            if intent_ids:
-                placeholders = ",".join("?" for _ in intent_ids)
-                cursor = db.execute(
-                    f"""SELECT COUNT(*) FROM temporary_users
-                    WHERE mark IN ('视频','直播') AND id IN ({placeholders})""",
-                    intent_ids,
-                )
-                kept = int(cursor.fetchone()[0])
-            if non_intent_ids:
-                placeholders = ",".join("?" for _ in non_intent_ids)
-                cursor = db.execute(
-                    f"""DELETE FROM temporary_users
-                    WHERE mark IN ('视频','直播') AND id IN ({placeholders})""",
-                    non_intent_ids,
-                )
-                deleted = int(cursor.rowcount)
-        return kept, deleted
 
     def dashboard_user_data(
         self, start_utc: str, end_utc: str

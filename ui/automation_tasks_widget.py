@@ -386,7 +386,7 @@ class AutomationTasksWidget(QWidget):
             try:
                 devices = [
                     item for item in self.adb_client.list_devices(include_details=False)
-                    if item.authorized
+                    if item.automation_ready
                 ]
             except Exception as exception:
                 error = str(exception)
@@ -561,7 +561,7 @@ class AutomationTasksWidget(QWidget):
             available = {
                 item.serial
                 for item in self.adb_client.list_devices(include_details=False)
-                if item.authorized
+                if item.automation_ready
             }
         except Exception as error:
             QMessageBox.warning(self, "无法调试任务", f"读取设备失败：{error}")
@@ -687,7 +687,7 @@ class AutomationTasksWidget(QWidget):
             available = {
                 item.serial
                 for item in self.adb_client.list_devices(include_details=False)
-                if item.authorized
+                if item.automation_ready
             }
         except Exception as error:
             self.repository.fail_job(job_id, f"无法读取监听设备：{error}")

@@ -690,7 +690,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.task_page.shutdown()
-        self.user_page.shutdown()
         self.automation_page.shutdown()
         for worker in list(self.task_page.workers.values()):
             worker.wait(3_000)

@@ -78,6 +78,8 @@ class TikTokSearchWorkflow:
         self.device = None
         self.cancel_event = Event()
         self._last_result_hint = ""
+        self._last_result_slot = 0
+        self._current_keyword = ""
         self._last_room_label = ""
         root = Path(__file__).resolve().parents[1]
         self.evidence_root = Path(evidence_root) if evidence_root else root / "data" / "evidence" / "tasks"
@@ -101,6 +103,7 @@ class TikTokSearchWorkflow:
             raise WorkflowError("搜索关键词不能为空")
         if content_type not in {"video", "live", "either"}:
             raise WorkflowError("内容类型必须是 video、live 或 either")
+        self._current_keyword = keyword
         try:
             self._emit(progress, "START_APP", "正在启动 TikTok", 8)
             self.adb.force_stop_app(self.serial, self.package)
@@ -293,14 +296,46 @@ class TikTokSearchWorkflow:
             if len(candidates) > slot:
                 candidates.sort(key=lambda item: (item.bounds[1], item.bounds[0]))
                 candidate = candidates[slot]
-                self._last_result_hint = self._single_line(
-                    candidate.description or candidate.text
-                )
+                self._last_result_slot = slot
+                self._last_result_hint = self._result_card_hint(nodes, candidate)
                 self.device.click(*candidate.center)
                 self._wait_content_open(content_type, 15)
                 return True
             sleep(0.7)
         return False
+
+    @classmethod
+    def _result_card_hint(cls, nodes: list[UINode], candidate: UINode) -> str:
+        """Read a stable creator/title hint from an otherwise empty cover node."""
+        left, top, right, bottom = candidate.bounds
+        nearby = [
+            item for item in nodes
+            if left <= item.center[0] <= right
+            and top - 80 <= item.center[1] <= bottom + 260
+        ]
+        preferred_suffixes = (
+            "/user_name", "/tv_username", "/title", "/tv_desc", "/desc"
+        )
+        values: list[str] = []
+        for preferred_only in (True, False):
+            for item in sorted(nearby, key=lambda value: (value.bounds[1], value.bounds[0])):
+                if preferred_only and not item.resource_id.endswith(preferred_suffixes):
+                    continue
+                value = cls._single_line(item.text or item.description)
+                if (
+                    value
+                    and value not in values
+                    and value not in {"直播", "LIVE", "视频"}
+                    and not value.replace(",", "").replace(".", "").isdigit()
+                ):
+                    values.append(value)
+            if values:
+                break
+        if not values:
+            value = cls._single_line(candidate.description or candidate.text)
+            if value:
+                values.append(value)
+        return "|".join(values[:5])[:240]
 
     @staticmethod
     def _result_candidates(nodes: list[UINode], content_type: str) -> list[UINode]:
@@ -432,6 +467,10 @@ class TikTokSearchWorkflow:
                 )
                 self._return_to_search_results("video")
                 continue
+            if room_recorded_callback:
+                room_recorded_callback(
+                    "video", room_key, keyword, self._last_room_label
+                )
             rooms_entered += 1
             self._emit(
                 progress,
@@ -449,10 +488,6 @@ class TikTokSearchWorkflow:
                 keyword=keyword,
                 user_callback=user_callback,
             )
-            if room_recorded_callback:
-                room_recorded_callback(
-                    "video", room_key, keyword, self._last_room_label
-                )
             total_count += count
             self._emit(
                 progress,
@@ -642,6 +677,10 @@ class TikTokSearchWorkflow:
                 )
                 self._return_to_search_results("live")
                 continue
+            if room_recorded_callback:
+                room_recorded_callback(
+                    "live", room_key, keyword, self._last_room_label
+                )
             rooms_entered += 1
             self._emit(
                 progress,
@@ -659,10 +698,6 @@ class TikTokSearchWorkflow:
                 user_callback=user_callback,
             )
             total_count += count
-            if room_recorded_callback:
-                room_recorded_callback(
-                    "live", room_key, keyword, self._last_room_label
-                )
             self._emit(
                 progress,
                 "ROOM_COMPLETED",
@@ -835,12 +870,22 @@ class TikTokSearchWorkflow:
                         if full_handle and any(
                             item.resource_id.endswith("/sb6") for item in full_nodes
                         ):
+                            # The profile shell appears before its counters have
+                            # necessarily finished refreshing on slower phones.
+                            sleep(1)
+                            self._check_cancelled()
+                            refreshed_nodes = self._nodes()
+                            refreshed_handle = next((
+                                item.text.strip() for item in refreshed_nodes
+                                if item.resource_id.endswith("/scn")
+                                and self._valid_handle(item.text.strip())
+                            ), "")
                             return ProfileInfo(
                                 username=username,
-                                handle=full_handle,
-                                following=self._profile_stat(full_nodes, "关注"),
-                                followers=self._profile_stat(full_nodes, "粉丝"),
-                                likes=self._profile_stat(full_nodes, "赞", "获赞"),
+                                handle=refreshed_handle or full_handle,
+                                following=self._profile_stat(refreshed_nodes, "关注"),
+                                followers=self._profile_stat(refreshed_nodes, "粉丝"),
+                                likes=self._profile_stat(refreshed_nodes, "赞", "获赞"),
                             )
                         sleep(0.4)
                     return None
@@ -865,28 +910,66 @@ class TikTokSearchWorkflow:
         return match.group(1) if match else "未知"
 
     def _room_identity(self, content_type: str) -> str:
-        nodes = self._nodes()
+        # The LIVE activity is reported before its creator/title nodes finish
+        # rendering. Wait briefly; otherwise every room receives the same
+        # empty `slot:` identity and unrelated rooms are skipped for 24 hours.
+        deadline = monotonic() + 5
+        room_values: list[str] = []
+        while monotonic() < deadline:
+            self._check_cancelled()
+            nodes = self._nodes()
+            room_values = self._room_identity_values(nodes, content_type)
+            if room_values:
+                break
+            sleep(0.4)
+
         values: list[str] = []
-        if self._last_result_hint:
-            values.append(self._last_result_hint)
-        preferred_suffixes = (
-            "/user_name", "/title", "/desc", "/tv_desc", "/b1o", "/scn"
-        )
-        for item in nodes:
-            if item.resource_id.endswith(preferred_suffixes):
-                value = self._single_line(item.text or item.description)
-                if value and value not in values:
-                    values.append(value)
-        if not values:
-            for item in nodes:
-                value = self._single_line(item.text or item.description)
-                if value.startswith("@") and value not in values:
-                    values.append(value)
-        stable_text = "|".join(values[:8]) or f"slot:{self._last_result_hint}"
+        for value in [self._last_result_hint, *room_values]:
+            if value and value not in values:
+                values.append(value)
+        stable_text = "|".join(values[:8])
+        if not stable_text:
+            stable_text = (
+                f"search:{self._current_keyword}|slot:{self._last_result_slot}"
+            )
         self._last_room_label = stable_text[:240]
         return hashlib.sha256(
             f"{content_type}|{stable_text}".encode("utf-8")
         ).hexdigest()
+
+    @classmethod
+    def _room_identity_values(
+        cls, nodes: list[UINode], content_type: str
+    ) -> list[str]:
+        primary_suffixes = (
+            ("/user_name", "/scn", "/title")
+            if content_type == "live"
+            else ("/title", "/desc", "/tv_desc", "/user_name", "/scn")
+        )
+        values: list[str] = []
+        for item in nodes:
+            if item.resource_id.endswith(primary_suffixes):
+                value = cls._single_line(item.text or item.description)
+                if value and value not in values:
+                    values.append(value)
+        if values:
+            return values[:6]
+
+        # Some LIVE versions expose only a combined accessibility label such
+        # as "creator,968". Remove the volatile viewer-count suffix.
+        for item in nodes:
+            if item.resource_id.endswith("/b1o"):
+                value = cls._single_line(item.text or item.description)
+                value = re.sub(r"[,，]\s*[\d.,万亿KkMm]+\s*$", "", value)
+                if value and value not in values:
+                    values.append(value)
+        if values:
+            return values[:3]
+        for item in nodes:
+            value = cls._single_line(item.text or item.description)
+            if value.startswith("@") and value not in values:
+                values.append(value)
+        return values[:3]
 
     @staticmethod
     def _visible_comment_entries(nodes: list[UINode]) -> list[CommentEntry]:
@@ -973,11 +1056,21 @@ class TikTokSearchWorkflow:
                         and item.bounds[1] < 900
                     ), "")
                 if handle:
+                    # Wait for asynchronously loaded profile counters, then
+                    # read the page again instead of using the first frame.
+                    sleep(1)
+                    self._check_cancelled()
+                    refreshed_nodes = self._nodes()
+                    refreshed_handle = next((
+                        item.text.strip() for item in refreshed_nodes
+                        if item.resource_id.endswith("/scn")
+                        and self._valid_handle(item.text.strip())
+                    ), "")
                     return ProfileInfo(
-                        handle=handle,
-                        following=self._profile_stat(nodes, "关注"),
-                        followers=self._profile_stat(nodes, "粉丝"),
-                        likes=self._profile_stat(nodes, "赞", "获赞"),
+                        handle=refreshed_handle or handle,
+                        following=self._profile_stat(refreshed_nodes, "关注"),
+                        followers=self._profile_stat(refreshed_nodes, "粉丝"),
+                        likes=self._profile_stat(refreshed_nodes, "赞", "获赞"),
                     )
                 sleep(0.5)
             return None
