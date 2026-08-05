@@ -3,3 +3,4 @@ requests>=2.32
 uiautomator2>=3.7
 numpy>=2.3
 opencv-python-headless>=4.13
+tzdata>=2025.2
