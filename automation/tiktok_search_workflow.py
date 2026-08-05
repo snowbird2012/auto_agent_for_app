@@ -18,6 +18,13 @@ import uiautomator2 as u2
 from devices import ADBClient
 
 
+# 冷启动到搜索入口可用的最长等待。实测低端机（OPPO A16 / Android 11）需要 21~28 秒，
+# 机型和网络越差越久，这里留出足够余量。
+SEARCH_READY_TIMEOUT = 60.0
+# 这段时间内只轮询、不按返回键：闪屏阶段按返回会把 App 逐层退出。
+SEARCH_BACK_GRACE = 25.0
+
+
 class WorkflowError(RuntimeError):
     pass
 
@@ -177,11 +184,18 @@ class TikTokSearchWorkflow:
             sleep(0.4)
         raise WorkflowError("TikTok 启动超时")
 
-    def _open_search(self) -> None:
+    def _open_search(self, timeout: float = SEARCH_READY_TIMEOUT) -> None:
         # TikTok can reopen on the Tako chat page. Only the real search field
         # (`hgt`) is accepted; generic EditTexts would submit the keyword to
         # Tako instead of executing a TikTok content search.
-        for _ in range(6):
+        #
+        # 冷启动期间首页尚未渲染，搜索按钮要等 20 秒以上才出现；这段时间按返回键
+        # 会把 App 逐层退出（连按几次就回到桌面），因此先纯轮询，
+        # 超过 SEARCH_BACK_GRACE 仍找不到首页时才认为停在了子页面，再按返回。
+        deadline = monotonic() + timeout
+        back_allowed_at = monotonic() + SEARCH_BACK_GRACE
+        while monotonic() < deadline:
+            self._check_cancelled()
             if self._find_node(
                 class_name="android.widget.EditText", resource_suffix="/hgt"
             ):
@@ -196,14 +210,17 @@ class TikTokSearchWorkflow:
                     self._wait_node(
                         lambda item: item.class_name == "android.widget.EditText"
                         and item.resource_id.endswith("/hgt"),
-                        4,
+                        8,
                     )
                     return
                 except WorkflowError:
                     pass
-            self.device.press("back")
-            sleep(0.8)
-        raise WorkflowError("无法打开 TikTok 搜索页面")
+            elif monotonic() >= back_allowed_at:
+                self.device.press("back")
+            sleep(1.0)
+        raise WorkflowError(
+            f"无法打开 TikTok 搜索页面（已等待 {timeout:.0f} 秒）"
+        )
 
     def _enter_keyword(self, keyword: str) -> None:
         field = self.device(resourceId=f"{self.package}:id/hgt")
