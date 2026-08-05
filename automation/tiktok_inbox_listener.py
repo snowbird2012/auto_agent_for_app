@@ -26,6 +26,7 @@ class TikTokInboxListener(TikTokMessageWorkflow):
         timeout: float | None = 60,
     ) -> dict[str, str] | None:
         try:
+            self._resolve_package()
             if self.device is None:
                 self.device = u2.connect(self.serial)
             self._return_to_tiktok_home()

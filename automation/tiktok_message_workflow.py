@@ -30,6 +30,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
         if not message:
             raise WorkflowError("发送消息不能为空")
         try:
+            self._resolve_package()
             self._emit(progress, "START_APP", "正在启动 TikTok", 8)
             self.adb.force_stop_app(self.serial, self.package)
             self.adb.start_app(self.serial, self.package)

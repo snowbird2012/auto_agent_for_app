@@ -253,7 +253,7 @@ class TaskCenterWidget(QWidget):
         self.collection_minutes_spin.setValue(2)
         self.collection_minutes_spin.setSuffix(" 分钟")
         self.app_combo = QComboBox()
-        self.app_combo.addItem("TikTok", "com.zhiliaoapp.musically")
+        self.app_combo.addItem("TikTok（自动识别包名）", "com.zhiliaoapp.musically")
         form.addRow("任务名称", self.name_edit)
         form.addRow("执行设备", self.device_combo)
         form.addRow("目标应用", self.app_combo)

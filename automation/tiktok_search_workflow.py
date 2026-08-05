@@ -75,6 +75,7 @@ class TikTokSearchWorkflow:
         self.adb = adb
         self.serial = serial
         self.package = package
+        self._package_resolved = False
         self.device = None
         self.cancel_event = Event()
         self._last_result_hint = ""
@@ -105,6 +106,7 @@ class TikTokSearchWorkflow:
             raise WorkflowError("内容类型必须是 video、live 或 either")
         self._current_keyword = keyword
         try:
+            self._resolve_package()
             self._emit(progress, "START_APP", "正在启动 TikTok", 8)
             self.adb.force_stop_app(self.serial, self.package)
             self.adb.start_app(self.serial, self.package)
@@ -150,6 +152,12 @@ class TikTokSearchWorkflow:
             if isinstance(error, WorkflowError):
                 raise WorkflowError(str(error) + suffix) from error
             raise WorkflowError(f"自动化执行失败：{error}{suffix}") from error
+
+    def _resolve_package(self) -> None:
+        if self._package_resolved:
+            return
+        self.package = self.adb.resolve_tiktok_package(self.serial, self.package)
+        self._package_resolved = True
 
     def _emit(self, callback: ProgressCallback, step: str, message: str, percent: int) -> None:
         self._check_cancelled()

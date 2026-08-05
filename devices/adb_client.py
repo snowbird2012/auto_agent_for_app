@@ -236,6 +236,43 @@ class ADBClient:
             raise ADBError("设备截图解码失败")
         return image
 
+    def list_installed_packages(self, serial: str, prefix: str = "") -> list[str]:
+        arguments = ["pm", "list", "packages"]
+        if prefix.strip():
+            arguments.append(prefix.strip())
+        output = self.shell(serial, arguments, timeout=12)
+        packages = {
+            line.split(":", 1)[1].strip()
+            for line in output.splitlines()
+            if line.strip().startswith("package:") and ":" in line
+        }
+        return sorted(item for item in packages if item)
+
+    def resolve_tiktok_package(
+        self, serial: str, preferred: str = DEFAULT_TIKTOK_PACKAGE
+    ) -> str:
+        """Resolve the standard TikTok package or a store-specific suffix variant."""
+        preferred = str(preferred or DEFAULT_TIKTOK_PACKAGE).strip()
+        installed = self.list_installed_packages(serial, DEFAULT_TIKTOK_PACKAGE)
+        candidates = [
+            item for item in installed
+            if item == DEFAULT_TIKTOK_PACKAGE
+            or item.startswith(DEFAULT_TIKTOK_PACKAGE + ".")
+        ]
+        if preferred in candidates:
+            return preferred
+        if not candidates:
+            raise ADBError(
+                "设备中未找到 TikTok，支持的包名前缀为："
+                f"{DEFAULT_TIKTOK_PACKAGE}"
+            )
+        # Prefer the official package. If only variants are installed, choose
+        # the shortest deterministic suffix (for example `.go`).
+        return min(
+            candidates,
+            key=lambda item: (item != DEFAULT_TIKTOK_PACKAGE, len(item), item),
+        )
+
     def shell(self, serial: str, arguments: Iterable[str], timeout: float | None = None) -> str:
         return self._run(["-s", serial, "shell", *arguments], timeout=timeout).stdout.strip()
 
@@ -243,11 +280,15 @@ class ADBClient:
         self.shell(serial, ["input", "keyevent", "KEYCODE_HOME"])
 
     def start_app(self, serial: str, package: str = DEFAULT_TIKTOK_PACKAGE) -> None:
+        if package == DEFAULT_TIKTOK_PACKAGE:
+            package = self.resolve_tiktok_package(serial, package)
         output = self.shell(serial, ["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=20)
         if "No activities found" in output or "monkey aborted" in output.lower():
             raise ADBError(f"设备中未找到应用：{package}")
 
     def force_stop_app(self, serial: str, package: str = DEFAULT_TIKTOK_PACKAGE) -> None:
+        if package == DEFAULT_TIKTOK_PACKAGE:
+            package = self.resolve_tiktok_package(serial, package)
         self.shell(serial, ["am", "force-stop", package])
 
     def _run(self, arguments: list[str], timeout: float | None = None, text: bool = True) -> subprocess.CompletedProcess:
