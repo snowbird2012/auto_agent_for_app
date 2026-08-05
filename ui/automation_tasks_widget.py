@@ -26,7 +26,7 @@ from automation import (
     TikTokMessageWorkflow,
     WorkflowCancelled,
 )
-from devices import ADBClient
+from devices import ADBClient, AndroidDevice
 from services.message_strategy_service import MessageStrategyService
 from storage import (
     AutomationJobRepository,
@@ -251,6 +251,7 @@ class AutomationTasksWidget(QWidget):
         self.adb_client = adb_client
         self.strategy_repository = strategy_repository
         self.conversation_repository = conversation_repository
+        self.ready_devices: dict[str, AndroidDevice] = {}
         self._has_tags = False
         self._has_devices = False
         self.debug_worker: MessageDebugWorker | None = None
@@ -380,29 +381,25 @@ class AutomationTasksWidget(QWidget):
     def refresh_devices(self) -> None:
         current = str(self.device_combo.currentData() or "")
         self.device_combo.clear()
-        devices = []
-        error = ""
-        if self.adb_client is not None:
-            try:
-                devices = [
-                    item for item in self.adb_client.list_devices(include_details=False)
-                    if item.automation_ready
-                ]
-            except Exception as exception:
-                error = str(exception)
+        devices = list(self.ready_devices.values())
         for device in devices:
             self.device_combo.addItem(
                 f"{device.display_name} · {device.serial}", device.serial
             )
         self._has_devices = bool(devices)
         if not devices:
-            self.device_combo.addItem(
-                "未发现可用设备" if not error else f"设备读取失败：{error}", ""
-            )
+            self.device_combo.addItem("等待设备扫描或暂无已就绪设备", "")
         index = self.device_combo.findData(current)
         if index >= 0:
             self.device_combo.setCurrentIndex(index)
         self._update_create_enabled()
+
+    def update_devices(self, devices: list[AndroidDevice]) -> None:
+        """Use the detailed readiness result produced by Device Management."""
+        self.ready_devices = {
+            item.serial: item for item in devices if item.automation_ready
+        }
+        self.refresh_devices()
 
     def refresh_tags(self) -> None:
         current = str(self.tag_combo.currentData() or "")
@@ -557,15 +554,7 @@ class AutomationTasksWidget(QWidget):
             QMessageBox.warning(self, "无法调试任务", "自动化任务不存在。")
             return
         serial = str(job["device_serial"] or "")
-        try:
-            available = {
-                item.serial
-                for item in self.adb_client.list_devices(include_details=False)
-                if item.automation_ready
-            }
-        except Exception as error:
-            QMessageBox.warning(self, "无法调试任务", f"读取设备失败：{error}")
-            return
+        available = set(self.ready_devices)
         if serial not in available:
             QMessageBox.warning(self, "无法调试任务", "任务所选设备当前未连接或未授权。")
             return
@@ -683,15 +672,7 @@ class AutomationTasksWidget(QWidget):
         if not serial or self.adb_client is None:
             self.repository.fail_job(job_id, "无法启动消息监听：执行设备不可用")
             return
-        try:
-            available = {
-                item.serial
-                for item in self.adb_client.list_devices(include_details=False)
-                if item.automation_ready
-            }
-        except Exception as error:
-            self.repository.fail_job(job_id, f"无法读取监听设备：{error}")
-            return
+        available = set(self.ready_devices)
         if serial not in available:
             self.repository.fail_job(job_id, "无法启动消息监听：设备未连接或未授权")
             return

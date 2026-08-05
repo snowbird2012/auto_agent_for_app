@@ -130,6 +130,7 @@ class MainWindow(QMainWindow):
             self.message_strategy_repository,
             self.conversation_repository,
         )
+        self.device_page.devices_updated.connect(self.automation_page.update_devices)
         self.pages.addWidget(self._scroll_page(self.automation_page))
         self.message_strategy_page = MessageStrategyWidget(self.message_strategy_repository,self.settings_repository)
         self.pages.addWidget(self._scroll_page(self.message_strategy_page))
@@ -693,6 +694,4 @@ class MainWindow(QMainWindow):
         self.automation_page.shutdown()
         for worker in list(self.task_page.workers.values()):
             worker.wait(3_000)
-        if self.user_page.intent_worker:
-            self.user_page.intent_worker.wait(3_000)
         super().closeEvent(event)
