@@ -61,8 +61,18 @@ class AndroidDevice:
 
 
 class ADBClient:
-    def __init__(self, adb_path: str | Path | None = None, timeout: float = 12.0) -> None:
-        self.adb_path = self._resolve_adb(adb_path)
+    def __init__(
+        self,
+        adb_path: str | Path | None = None,
+        timeout: float = 12.0,
+        allow_missing: bool = False,
+    ) -> None:
+        try:
+            self.adb_path: Path | None = self._resolve_adb(adb_path)
+        except ADBError:
+            if not allow_missing:
+                raise
+            self.adb_path = None
         self.timeout = timeout
 
     @staticmethod
@@ -70,12 +80,21 @@ class ADBClient:
         candidates: list[str | Path | None] = [
             explicit,
             shutil.which("adb"),
+            Path.home() / "platform-tools/adb.exe",
+            Path.home() / "Android/Sdk/platform-tools/adb.exe",
+            Path("C:/platform-tools/adb.exe"),
             Path("C:/Program Files/platform-tools/adb.exe"),
             Path.home() / "AppData/Local/Android/Sdk/platform-tools/adb.exe",
         ]
         for candidate in candidates:
-            if candidate and Path(candidate).is_file():
-                return Path(candidate).resolve()
+            if not candidate:
+                continue
+            path = Path(str(candidate).strip().strip('"')).expanduser()
+            # The settings page accepts either adb.exe itself or its folder.
+            if path.is_dir():
+                path = path / ("adb.exe" if os.name == "nt" else "adb")
+            if path.is_file():
+                return path.resolve()
         raise ADBError("未找到 adb，请安装 Android platform-tools 或将 adb 加入 PATH")
 
     def list_devices(self, include_details: bool = True) -> list[AndroidDevice]:
@@ -296,6 +315,10 @@ class ADBClient:
         self.shell(serial, ["am", "force-stop", package])
 
     def _run(self, arguments: list[str], timeout: float | None = None, text: bool = True) -> subprocess.CompletedProcess:
+        if self.adb_path is None:
+            raise ADBError(
+                "未找到 adb，请在系统设置中配置 ADB 路径，或将 adb 加入 PATH"
+            )
         command = [str(self.adb_path), *arguments]
         startupinfo = None
         creationflags = 0

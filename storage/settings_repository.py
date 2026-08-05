@@ -284,6 +284,14 @@ class SettingsRepository:
         self.set_setting("timezone", normalized)
         return normalized
 
+    def get_adb_path(self) -> str:
+        return str(self.get_setting("adb_path", "") or "").strip()
+
+    def save_adb_path(self, adb_path: str | Path | None) -> str:
+        normalized = str(adb_path or "").strip().strip('"')
+        self.set_setting("adb_path", normalized)
+        return normalized
+
     def get_proxy_settings(self, reveal_password: bool = False) -> dict[str, Any]:
         defaults = {
             "enabled": False,

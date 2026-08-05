@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -81,13 +82,36 @@ class MainWindow(QMainWindow):
         )
         self.message_strategy_repository = MessageStrategyRepository(self.settings_repository.database_path)
         self.conversation_repository = ConversationRepository(self.settings_repository.database_path)
-        self.adb_client = ADBClient()
+        # Keep the settings UI available even before ADB is installed/configured.
+        self.adb_client = ADBClient(
+            self.settings_repository.get_adb_path(), allow_missing=True
+        )
         self.setWindowTitle("AutoAgent · Android")
         self.resize(1480, 900)
         self.setMinimumSize(1180, 720)
         self.nav_buttons: list[QPushButton] = []
         self._build_ui()
         self._switch_page(0)
+        if self.adb_client.adb_path is None:
+            QTimer.singleShot(0, self._show_missing_adb_prompt)
+
+    def _show_missing_adb_prompt(self) -> None:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("未找到 ADB")
+        dialog.setText("程序未检测到 ADB")
+        dialog.setInformativeText(
+            "请安装 Android SDK Platform-Tools。\n\n"
+            "如果已经安装，请进入“系统设置 → 基本设置”，手动指定 "
+            "adb.exe 文件或 platform-tools 目录。"
+        )
+        settings_button = dialog.addButton(
+            "打开系统设置", QMessageBox.ButtonRole.ActionRole
+        )
+        dialog.addButton("稍后处理", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() is settings_button:
+            self._switch_page(NAV_ITEMS.index("系统设置"))
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -562,6 +586,27 @@ class MainWindow(QMainWindow):
         timezone_combo.addItems(list(COMMON_TIMEZONES))
         timezone_combo.setCurrentText(self.settings_repository.get_timezone())
         form.addRow("显示时区", timezone_combo)
+
+        adb_path = QLineEdit(self.settings_repository.get_adb_path())
+        adb_path.setPlaceholderText("留空自动查找；也可填写 adb.exe 或 platform-tools 目录")
+        adb_path_row = QHBoxLayout()
+        adb_path_row.setContentsMargins(0, 0, 0, 0)
+        adb_path_row.addWidget(adb_path, 1)
+        browse_adb = QPushButton("浏览")
+        adb_path_row.addWidget(browse_adb)
+        form.addRow("ADB 路径", adb_path_row)
+
+        def choose_adb_path() -> None:
+            selected, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择 adb 可执行文件",
+                adb_path.text().strip(),
+                "ADB 可执行文件 (adb.exe adb);;所有文件 (*)",
+            )
+            if selected:
+                adb_path.setText(selected)
+
+        browse_adb.clicked.connect(choose_adb_path)
         content.addLayout(form)
         save = QPushButton("保存基本设置")
         save.setObjectName("Primary")
@@ -574,9 +619,27 @@ class MainWindow(QMainWindow):
             except ValueError as error:
                 QMessageBox.warning(self, "时区无效", str(error))
                 return
+            configured_adb_path = self.settings_repository.save_adb_path(
+                adb_path.text()
+            )
+            try:
+                resolved_adb_path = ADBClient._resolve_adb(configured_adb_path)
+            except Exception as error:
+                QMessageBox.warning(
+                    self,
+                    "ADB 路径无效",
+                    f"基本设置已保存，但当前无法找到 adb：\n{error}",
+                )
+                return
+            self.adb_client.adb_path = resolved_adb_path
+            self.device_page.scan_status.setText(f"ADB：{resolved_adb_path}")
+            self.device_page.scan_devices()
             timezone_combo.setCurrentText(timezone_name)
             self.user_page.refresh_users()
-            self._info("保存成功", f"列表显示时区已设置为 {timezone_name}。")
+            self._info(
+                "保存成功",
+                f"列表显示时区已设置为 {timezone_name}。\nADB：{resolved_adb_path}",
+            )
 
         save.clicked.connect(save_basic_settings)
         content.addWidget(save)

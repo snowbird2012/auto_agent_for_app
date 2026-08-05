@@ -163,7 +163,8 @@ class DeviceManagementWidget(QWidget):
         header = QHBoxLayout()
         header.addWidget(SectionHeader("设备管理", "通过 ADB 发现、监控并操作已连接的 Android 设备"))
         header.addStretch()
-        self.scan_status = label(f"ADB：{self.client.adb_path}", "Small")
+        adb_status = self.client.adb_path or "未找到，请到系统设置中配置"
+        self.scan_status = label(f"ADB：{adb_status}", "Small")
         header.addWidget(self.scan_status)
         self.scan_button = QPushButton("扫描 USB 设备")
         self.scan_button.setObjectName("Primary")
@@ -269,6 +270,10 @@ class DeviceManagementWidget(QWidget):
         layout.addStretch()
 
     def scan_devices(self) -> None:
+        if self.client.adb_path is None:
+            self.scan_status.setText("ADB：未找到，请到系统设置中配置")
+            self.devices_updated.emit([])
+            return
         if self.scan_worker and self.scan_worker.isRunning():
             return
         if self.action_worker and self.action_worker.action == "init_uiautomator2":
