@@ -17,6 +17,9 @@ import numpy as np
 
 
 DEFAULT_TIKTOK_PACKAGE = "com.zhiliaoapp.musically"
+# TikTok 按发行地区有两个互不相同的包名，不是前缀关系：
+# 东南亚等地区的机器装的通常是 trill。各自还可能带 `.go` 之类的商店后缀。
+TIKTOK_PACKAGES = (DEFAULT_TIKTOK_PACKAGE, "com.ss.android.ugc.trill")
 
 
 class ADBError(RuntimeError):
@@ -251,26 +254,27 @@ class ADBClient:
     def resolve_tiktok_package(
         self, serial: str, preferred: str = DEFAULT_TIKTOK_PACKAGE
     ) -> str:
-        """Resolve the standard TikTok package or a store-specific suffix variant."""
+        """Resolve any known TikTok package or its store-specific suffix variant."""
         preferred = str(preferred or DEFAULT_TIKTOK_PACKAGE).strip()
-        installed = self.list_installed_packages(serial, DEFAULT_TIKTOK_PACKAGE)
+        installed: list[str] = []
+        for package in TIKTOK_PACKAGES:
+            installed.extend(self.list_installed_packages(serial, package))
         candidates = [
-            item for item in installed
-            if item == DEFAULT_TIKTOK_PACKAGE
-            or item.startswith(DEFAULT_TIKTOK_PACKAGE + ".")
+            item for item in dict.fromkeys(installed)
+            if any(item == p or item.startswith(p + ".") for p in TIKTOK_PACKAGES)
         ]
         if preferred in candidates:
             return preferred
         if not candidates:
             raise ADBError(
                 "设备中未找到 TikTok，支持的包名前缀为："
-                f"{DEFAULT_TIKTOK_PACKAGE}"
+                f"{'、'.join(TIKTOK_PACKAGES)}"
             )
         # Prefer the official package. If only variants are installed, choose
         # the shortest deterministic suffix (for example `.go`).
         return min(
             candidates,
-            key=lambda item: (item != DEFAULT_TIKTOK_PACKAGE, len(item), item),
+            key=lambda item: (item not in TIKTOK_PACKAGES, len(item), item),
         )
 
     def shell(self, serial: str, arguments: Iterable[str], timeout: float | None = None) -> str:
