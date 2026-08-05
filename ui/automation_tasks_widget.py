@@ -97,7 +97,9 @@ class MessageDebugWorker(QThread):
             self.workflow.cancel()
 
     def run(self) -> None:
+        screen_session = None
         try:
+            screen_session = self.adb.begin_screen_awake(self.serial)
             self.workflow = TikTokMessageWorkflow(self.adb, self.serial)
             normalized = self.workflow.run_message(
                 self.handle,
@@ -113,7 +115,15 @@ class MessageDebugWorker(QThread):
         except WorkflowCancelled as error:
             self.cancelled.emit(str(error))
         except Exception as error:
-            self.failed.emit(str(error))
+            message = str(error)
+            if "屏幕状态：" not in message:
+                message += (
+                    f"；屏幕状态：{self.adb.describe_screen_state(self.serial)}"
+                )
+            self.failed.emit(message)
+        finally:
+            if screen_session is not None:
+                self.adb.end_screen_awake(self.serial, screen_session)
 
     def _listen_loop(self) -> None:
         while True:
@@ -180,7 +190,9 @@ class InboxListenWorker(QThread):
             self.workflow.cancel()
 
     def run(self) -> None:
+        screen_session = None
         try:
+            screen_session = self.adb.begin_screen_awake(self.serial)
             self.workflow = TikTokInboxListener(self.adb, self.serial)
             while True:
                 record = self.workflow.listen_once(
@@ -228,7 +240,15 @@ class InboxListenWorker(QThread):
         except WorkflowCancelled as error:
             self.cancelled.emit(str(error))
         except Exception as error:
-            self.failed.emit(str(error))
+            message = str(error)
+            if "屏幕状态：" not in message:
+                message += (
+                    f"；屏幕状态：{self.adb.describe_screen_state(self.serial)}"
+                )
+            self.failed.emit(message)
+        finally:
+            if screen_session is not None:
+                self.adb.end_screen_awake(self.serial, screen_session)
 
 
 class AutomationTasksWidget(QWidget):

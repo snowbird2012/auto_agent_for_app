@@ -1,5 +1,5 @@
 """Android device discovery and control."""
 
-from devices.adb_client import ADBClient, ADBError, AndroidDevice
+from devices.adb_client import ADBClient, ADBError, AndroidDevice, ScreenAwakeSession
 
-__all__ = ["ADBClient", "ADBError", "AndroidDevice"]
+__all__ = ["ADBClient", "ADBError", "AndroidDevice", "ScreenAwakeSession"]

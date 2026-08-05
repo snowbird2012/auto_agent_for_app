@@ -91,14 +91,17 @@ class TaskExecutionWorker(QThread):
 
     def run(self) -> None:
         task_id = int(self.task["id"])
+        serial = str(self.task["device_serial"])
+        screen_session = None
         try:
+            screen_session = self.adb.begin_screen_awake(serial)
             keywords = self.task.get("keywords") or []
             if not keywords:
                 raise ValueError("任务没有搜索关键词")
             keyword = str(keywords[0]).strip()
             self.workflow = TikTokSearchWorkflow(
                 self.adb,
-                self.task["device_serial"],
+                serial,
                 self.task["app_package"],
             )
             chosen_type = self.workflow.run(
@@ -121,7 +124,13 @@ class TaskExecutionWorker(QThread):
         except WorkflowCancelled as error:
             self.cancelled.emit(task_id, str(error))
         except Exception as error:
-            self.failed.emit(task_id, str(error))
+            message = str(error)
+            if "屏幕状态：" not in message:
+                message += f"；屏幕状态：{self.adb.describe_screen_state(serial)}"
+            self.failed.emit(task_id, message)
+        finally:
+            if screen_session is not None:
+                self.adb.end_screen_awake(serial, screen_session)
 
     def _store_user(self, task_id: int, record: dict) -> bool:
         values = dict(record)

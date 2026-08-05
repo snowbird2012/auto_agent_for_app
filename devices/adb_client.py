@@ -60,6 +60,12 @@ class AndroidDevice:
         return name or self.model or self.device_name or self.serial
 
 
+@dataclass(frozen=True, slots=True)
+class ScreenAwakeSession:
+    screen_off_timeout: str
+    stay_on_while_plugged_in: str
+
+
 class ADBClient:
     def __init__(
         self,
@@ -257,6 +263,97 @@ class ADBClient:
         if image is None:
             raise ADBError("设备截图解码失败")
         return image
+
+    def begin_screen_awake(self, serial: str) -> ScreenAwakeSession:
+        """Wake the device and temporarily prevent automatic screen-off."""
+        session = ScreenAwakeSession(
+            screen_off_timeout=self.shell(
+                serial, ["settings", "get", "system", "screen_off_timeout"]
+            ),
+            stay_on_while_plugged_in=self.shell(
+                serial,
+                ["settings", "get", "global", "stay_on_while_plugged_in"],
+            ),
+        )
+        try:
+            self.shell(
+                serial,
+                ["settings", "put", "system", "screen_off_timeout", "2147483647"],
+            )
+            self.shell(
+                serial,
+                ["settings", "put", "global", "stay_on_while_plugged_in", "7"],
+            )
+            self.shell(serial, ["input", "keyevent", "KEYCODE_WAKEUP"])
+            # This dismisses swipe/no-security keyguards but does not bypass a
+            # PIN, password, pattern, or biometric lock.
+            self.shell(serial, ["wm", "dismiss-keyguard"])
+            state = self.describe_screen_state(serial)
+            if state.startswith("熄屏"):
+                raise ADBError(f"无法唤醒设备；屏幕状态：{state}")
+            return session
+        except Exception:
+            self.end_screen_awake(serial, session)
+            raise
+
+    def end_screen_awake(self, serial: str, session: ScreenAwakeSession) -> None:
+        """Best-effort restoration of settings changed by begin_screen_awake."""
+        self._restore_setting(
+            serial, "system", "screen_off_timeout", session.screen_off_timeout
+        )
+        self._restore_setting(
+            serial,
+            "global",
+            "stay_on_while_plugged_in",
+            session.stay_on_while_plugged_in,
+        )
+
+    def _restore_setting(
+        self, serial: str, namespace: str, key: str, previous: str
+    ) -> None:
+        try:
+            value = str(previous or "").strip()
+            if not value or value.lower() == "null":
+                self.shell(serial, ["settings", "delete", namespace, key])
+            else:
+                self.shell(serial, ["settings", "put", namespace, key, value])
+        except Exception:
+            # Restoration must never hide the task's original result/error.
+            pass
+
+    def describe_screen_state(self, serial: str) -> str:
+        """Return a compact state string suitable for task error logs."""
+        try:
+            power = self.shell(serial, ["dumpsys", "power"], timeout=8)
+            window = self.shell(serial, ["dumpsys", "window", "policy"], timeout=8)
+        except Exception as error:
+            return f"读取失败（{error}）"
+
+        wake_match = re.search(r"mWakefulness=(\w+)", power, re.IGNORECASE)
+        wakefulness = wake_match.group(1) if wake_match else "未知"
+        interactive_match = re.search(r"mInteractive=(true|false)", power, re.IGNORECASE)
+        display_match = re.search(
+            r"(?:Display Power.*?state|mScreenState)\s*=\s*(ON|OFF)",
+            power,
+            re.IGNORECASE,
+        )
+        if interactive_match:
+            screen_on = interactive_match.group(1).lower() == "true"
+        elif display_match:
+            screen_on = display_match.group(1).upper() == "ON"
+        else:
+            screen_on = wakefulness.lower() in {"awake", "dreaming"}
+
+        lock_matches = re.findall(
+            r"(?:mShowingLockscreen|mDreamingLockscreen|isStatusBarKeyguard|"
+            r"mIsShowing|\bshowing)"
+            r"\s*=\s*(true|false)",
+            window,
+            re.IGNORECASE,
+        )
+        locked = any(value.lower() == "true" for value in lock_matches)
+        lock_text = "已锁定" if locked else ("未锁定" if lock_matches else "锁屏状态未知")
+        return f"{'亮屏' if screen_on else '熄屏'}，{lock_text}，Wakefulness={wakefulness}"
 
     def list_installed_packages(self, serial: str, prefix: str = "") -> list[str]:
         arguments = ["pm", "list", "packages"]
