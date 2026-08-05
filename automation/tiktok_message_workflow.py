@@ -35,6 +35,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
             self.adb.force_stop_app(self.serial, self.package)
             self.adb.start_app(self.serial, self.package)
             self.device = u2.connect(self.serial)
+            self._capture_screen_size()
             self._wait_package(12)
 
             self._emit(progress, "OPEN_SEARCH", "正在打开 TikTok 搜索", 18)
@@ -90,7 +91,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
         while monotonic() < deadline:
             self._check_cancelled()
             node = self._find_first(
-                lambda item: item.bounds[1] < 450
+                lambda item: item.bounds[1] < self._sy(450)
                 and (item.description == "用户" or item.text == "用户")
             )
             if node:
@@ -98,7 +99,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
                     self.device.click(*node.center)
                     sleep(1)
                 selected = self._find_first(
-                    lambda item: item.bounds[1] < 450
+                    lambda item: item.bounds[1] < self._sy(450)
                     and (item.description == "用户" or item.text == "用户")
                     and item.selected
                 )
@@ -148,7 +149,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
 
     def _open_message_page(self, handle: str) -> None:
         message_node = self._wait_node(
-            lambda item: item.text == "消息" and item.bounds[1] > 400,
+            lambda item: item.text == "消息" and item.bounds[1] > self._sy(400),
             10,
         )
         self.device.click(*message_node.center)
@@ -180,8 +181,8 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
             before = self._chat_fingerprint(nodes, chat_list.bounds)
             left, top, right, bottom = chat_list.bounds
             x = (left + right) // 2
-            start_y = top + max(120, int((bottom - top) * 0.28))
-            end_y = bottom - max(80, int((bottom - top) * 0.08))
+            start_y = top + max(self._sy(120), int((bottom - top) * 0.28))
+            end_y = bottom - max(self._sy(80), int((bottom - top) * 0.08))
             self.device.swipe(x, start_y, x, end_y, duration=0.35)
             sleep(0.65)
             after_nodes = self._nodes()

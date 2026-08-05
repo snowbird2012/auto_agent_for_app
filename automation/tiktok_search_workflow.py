@@ -43,6 +43,9 @@ class UINode:
     selected: bool
     bounds: tuple[int, int, int, int]
     container_key: str = ""
+    container_bounds: tuple[int, int, int, int] | None = None
+    container_parent_class: str = ""
+    container_parent_resource: str = ""
 
     @property
     def center(self) -> tuple[int, int]:
@@ -60,6 +63,12 @@ class CommentEntry:
     username: str
     comment: str
     title_node: UINode
+    bounds: tuple[int, int, int, int] | None = None
+    is_reply: bool = False
+
+    @property
+    def key(self) -> tuple[str, str, bool]:
+        return self.username, self.comment, self.is_reply
 
 
 @dataclass(slots=True)
@@ -78,6 +87,13 @@ RoomRecordedCallback = Callable[[str, str, str, str], None]
 
 
 class TikTokSearchWorkflow:
+    REFERENCE_WIDTH = 1080
+    REFERENCE_HEIGHT = 2400
+    COMMENT_VISIBLE_TOP_RATIO = 850 / REFERENCE_HEIGHT
+    COMMENT_VISIBLE_BOTTOM_RATIO = 2200 / REFERENCE_HEIGHT
+    RESULT_CONTENT_TOP_RATIO = 360 / REFERENCE_HEIGHT
+    RESULT_MIN_AREA_RATIO = 120_000 / (REFERENCE_WIDTH * REFERENCE_HEIGHT)
+
     def __init__(self, adb: ADBClient, serial: str, package: str = "com.zhiliaoapp.musically", evidence_root: str | Path | None = None) -> None:
         self.adb = adb
         self.serial = serial
@@ -89,6 +105,8 @@ class TikTokSearchWorkflow:
         self._last_result_slot = 0
         self._current_keyword = ""
         self._last_room_label = ""
+        self._screen_width = self.REFERENCE_WIDTH
+        self._screen_height = self.REFERENCE_HEIGHT
         root = Path(__file__).resolve().parents[1]
         self.evidence_root = Path(evidence_root) if evidence_root else root / "data" / "evidence" / "tasks"
 
@@ -118,6 +136,7 @@ class TikTokSearchWorkflow:
             self.adb.force_stop_app(self.serial, self.package)
             self.adb.start_app(self.serial, self.package)
             self.device = u2.connect(self.serial)
+            self._capture_screen_size()
             self._wait_package(12)
 
             self._emit(progress, "OPEN_SEARCH", "正在定位搜索入口", 18)
@@ -129,6 +148,15 @@ class TikTokSearchWorkflow:
             self._emit(progress, "WAIT_RESULTS", "等待搜索结果加载", 48)
             self._wait_search_results(15)
 
+            requested_label = {
+                "video": "视频", "live": "直播", "either": "视频或直播"
+            }[content_type]
+            self._emit(
+                progress,
+                "SELECT_CONTENT",
+                f"搜索结果已加载，正在选择{requested_label}分类",
+                52,
+            )
             chosen_type = self._choose_category(content_type)
             if chosen_type == "video":
                 self._collect_video_rooms(
@@ -159,6 +187,33 @@ class TikTokSearchWorkflow:
             if isinstance(error, WorkflowError):
                 raise WorkflowError(str(error) + suffix) from error
             raise WorkflowError(f"自动化执行失败：{error}{suffix}") from error
+
+    def _capture_screen_size(self) -> tuple[int, int]:
+        try:
+            width, height = self.device.window_size()
+            width, height = int(width), int(height)
+            if width > 0 and height > 0:
+                self._screen_width, self._screen_height = width, height
+        except Exception:
+            pass
+        return (
+            int(getattr(self, "_screen_width", self.REFERENCE_WIDTH)),
+            int(getattr(self, "_screen_height", self.REFERENCE_HEIGHT)),
+        )
+
+    def _screen_size(self) -> tuple[int, int]:
+        """Return the cached task screen size without repeated device RPCs."""
+        if hasattr(self, "_screen_width") and hasattr(self, "_screen_height"):
+            return int(self._screen_width), int(self._screen_height)
+        return self._capture_screen_size()
+
+    def _sx(self, reference_x: int | float) -> int:
+        width, _ = self._screen_size()
+        return round(width * float(reference_x) / self.REFERENCE_WIDTH)
+
+    def _sy(self, reference_y: int | float) -> int:
+        _, height = self._screen_size()
+        return round(height * float(reference_y) / self.REFERENCE_HEIGHT)
 
     def _resolve_package(self) -> None:
         if self._package_resolved:
@@ -202,7 +257,7 @@ class TikTokSearchWorkflow:
                 return
             node = self._find_first(
                 lambda item: item.description == "搜索"
-                and item.clickable and item.bounds[1] < 500
+                and item.clickable and item.bounds[1] < self._sy(500)
             )
             if node:
                 self.device.click(*node.center)
@@ -238,16 +293,24 @@ class TikTokSearchWorkflow:
             self.device.press("enter")
 
     def _wait_search_results(self, timeout: float) -> None:
-        self._wait_node(
-            lambda item: (
-                item.bounds[1] < 450
+        # timeout is only a failure ceiling. There is no minimum wait: the
+        # first hierarchy containing a result-category marker returns at once.
+        category_bottom = self._sy(450)
+        deadline = monotonic() + timeout
+        while monotonic() < deadline:
+            self._check_cancelled()
+            nodes = self._nodes()
+            if any(
+                item.bounds[1] < category_bottom
                 and (
                     item.description in {"综合", "视频", "直播"}
                     or item.text in {"综合", "视频", "直播"}
                 )
-            ),
-            timeout,
-        )
+                for item in nodes
+            ):
+                return
+            sleep(1.0)
+        raise WorkflowError(f"等待搜索结果加载超时（{timeout:g} 秒）")
 
     def _choose_category(self, requested: str) -> str:
         options = [requested] if requested != "either" else ["video", "live"]
@@ -265,9 +328,15 @@ class TikTokSearchWorkflow:
                 # asynchronously. Search in both directions, starting the
                 # gesture outside the fixed Tako tab so it reaches the strip.
                 if swipe_index % 2 == 0:
-                    self.device.swipe(880, 320, 300, 320, duration=0.35)
+                    self.device.swipe(
+                        self._sx(880), self._sy(320),
+                        self._sx(300), self._sy(320), duration=0.35,
+                    )
                 else:
-                    self.device.swipe(760, 320, 1030, 320, duration=0.35)
+                    self.device.swipe(
+                        self._sx(760), self._sy(320),
+                        self._sx(1030), self._sy(320), duration=0.35,
+                    )
                 swipe_index += 1
                 sleep(0.8)
         raise WorkflowError("搜索结果中没有找到视频或直播分类")
@@ -277,7 +346,7 @@ class TikTokSearchWorkflow:
         # text such as “直播” and must never be mistaken for a tab.
         nodes = [
             item for item in self._nodes()
-            if item.bounds[1] < 450
+            if item.bounds[1] < self._sy(450)
             and (item.description == label or item.text == label)
         ]
         if not nodes:
@@ -289,6 +358,7 @@ class TikTokSearchWorkflow:
 
     def _activate_category(self, label: str) -> bool:
         deadline = monotonic() + 8
+        next_click_at = 0.0
         while monotonic() < deadline:
             self._check_cancelled()
             node = self._category_node(label)
@@ -296,14 +366,13 @@ class TikTokSearchWorkflow:
                 return False
             if node.selected:
                 return True
-            self.device.click(*node.center)
-            sleep(0.9)
-            # The category bar can shift while results are first rendered.
-            # Re-dump and verify selection instead of trusting stale bounds.
-            selected = self._category_node(label)
-            if selected and selected.selected:
-                sleep(0.5)
-                return True
+            now = monotonic()
+            if now >= next_click_at:
+                self.device.click(*node.center)
+                next_click_at = now + 1.0
+            # Poll the accessibility selected flag; it usually changes on the
+            # next hierarchy frame, so do not impose a fixed post-click delay.
+            sleep(0.15)
         return False
 
     def _open_first_result(self, content_type: str) -> None:
@@ -317,7 +386,10 @@ class TikTokSearchWorkflow:
         while monotonic() < deadline:
             self._check_cancelled()
             nodes = self._nodes()
-            candidates = self._result_candidates(nodes, content_type)
+            width, height = self._screen_size()
+            candidates = self._result_candidates(
+                nodes, content_type, width, height
+            )
             if len(candidates) > slot:
                 candidates.sort(key=lambda item: (item.bounds[1], item.bounds[0]))
                 candidate = candidates[slot]
@@ -363,16 +435,31 @@ class TikTokSearchWorkflow:
         return "|".join(values[:5])[:240]
 
     @staticmethod
-    def _result_candidates(nodes: list[UINode], content_type: str) -> list[UINode]:
+    def _result_candidates(
+        nodes: list[UINode],
+        content_type: str,
+        screen_width: int = REFERENCE_WIDTH,
+        screen_height: int = REFERENCE_HEIGHT,
+    ) -> list[UINode]:
         """Return result cards, including TikTok's non-clickable live covers."""
+        top = round(
+            screen_height * TikTokSearchWorkflow.RESULT_CONTENT_TOP_RATIO
+        )
+        min_card_width = round(screen_width * 400 / TikTokSearchWorkflow.REFERENCE_WIDTH)
+        max_card_width = round(screen_width * 650 / TikTokSearchWorkflow.REFERENCE_WIDTH)
+        min_card_height = round(screen_height * 600 / TikTokSearchWorkflow.REFERENCE_HEIGHT)
+        min_card_area = round(
+            screen_width * screen_height
+            * TikTokSearchWorkflow.RESULT_MIN_AREA_RATIO
+        )
         if content_type == "live":
             # On current TikTok builds live cover nodes are deliberately marked
             # clickable=false. Android still dispatches a tap on their bounds to
             # the parent GridView, so do not apply the clickable filter here.
             covers = [
                 item for item in nodes
-                if item.resource_id.endswith("/mm_") and item.bounds[1] >= 360
-                and item.area >= 120_000
+                if item.resource_id.endswith("/mm_") and item.bounds[1] >= top
+                and item.area >= min_card_area
             ]
             if covers:
                 return covers
@@ -382,21 +469,21 @@ class TikTokSearchWorkflow:
             return [
                 item for item in nodes
                 if item.class_name == "android.widget.FrameLayout"
-                and item.bounds[1] >= 360
-                and 400 <= item.bounds[2] - item.bounds[0] <= 650
-                and item.bounds[3] - item.bounds[1] >= 600
+                and item.bounds[1] >= top
+                and min_card_width <= item.bounds[2] - item.bounds[0] <= max_card_width
+                and item.bounds[3] - item.bounds[1] >= min_card_height
             ]
 
         covers = [
             item for item in nodes
             if item.clickable and item.resource_id.endswith("/umr")
-            and item.bounds[1] >= 360
+            and item.bounds[1] >= top
         ]
         if covers:
             return covers
         return [
             item for item in nodes
-            if item.clickable and item.bounds[1] >= 360 and item.area >= 120_000
+            if item.clickable and item.bounds[1] >= top and item.area >= min_card_area
             and item.class_name in {"android.widget.FrameLayout", "android.view.ViewGroup"}
         ]
 
@@ -476,7 +563,10 @@ class TikTokSearchWorkflow:
                 empty_result_pages += 1
                 if empty_result_pages >= 3:
                     break
-                self.device.swipe(540, 2050, 540, 650, duration=0.6)
+                self.device.swipe(
+                    self._sx(540), self._sy(2050),
+                    self._sx(540), self._sy(650), duration=0.6,
+                )
                 sleep(1.0)
                 result_slot = 0
                 continue
@@ -551,7 +641,7 @@ class TikTokSearchWorkflow:
             nodes = self._nodes()
             has_search = any(item.resource_id.endswith("/hgt") for item in nodes)
             has_category_tab = any(
-                item.bounds[1] < 450
+                item.bounds[1] < self._sy(450)
                 and (item.text == category or item.description == category)
                 for item in nodes
             )
@@ -577,7 +667,7 @@ class TikTokSearchWorkflow:
         collected: set[tuple[str, str]] = set()
         profile_failures: dict[tuple[str, str], int] = {}
         stagnant_scrolls = 0
-        last_signature: tuple[tuple[str, str], ...] = ()
+        last_signature: tuple[tuple[str, str, bool], ...] = ()
         self._emit(
             progress,
             "COLLECT_COMMENTS",
@@ -596,7 +686,15 @@ class TikTokSearchWorkflow:
             if attempts > max_comments * 6 + 60:
                 break
             self._ensure_comment_page()
-            entries = self._visible_comment_entries(self._nodes())
+            screen_width, screen_height = self._screen_size()
+            nodes = self._nodes()
+            page_rows = self._visible_comment_entries(
+                nodes,
+                screen_height=screen_height,
+                screen_width=screen_width,
+                include_replies=True,
+            )
+            entries = [entry for entry in page_rows if not entry.is_reply]
             pending = next(
                 (entry for entry in entries if (entry.username, entry.comment) not in collected),
                 None,
@@ -644,12 +742,152 @@ class TikTokSearchWorkflow:
                 sleep(0.5)
                 continue
 
-            signature = tuple((item.username, item.comment) for item in entries)
-            stagnant_scrolls = stagnant_scrolls + 1 if signature == last_signature else 0
+            signature = tuple(item.key for item in page_rows)
+            stagnant_scrolls = (
+                stagnant_scrolls + 1 if signature == last_signature else 0
+            )
             last_signature = signature
-            self.device.swipe(540, 1990, 540, 1210, duration=0.5)
-            sleep(1.0)
+            if not self._scroll_comment_page(nodes, page_rows):
+                stagnant_scrolls += 1
         return len(collected)
+
+    def _scroll_comment_page(
+        self, nodes: list[UINode], rows: list[CommentEntry]
+    ) -> bool:
+        """Scroll with a retained row anchor so variable-height rows are not skipped."""
+        if self._send_to_marker(nodes):
+            self._dismiss_send_to_sheet(nodes)
+            nodes = self._nodes()
+        width, height = self._screen_size()
+        if not rows:
+            rows = self._visible_comment_entries(
+                nodes,
+                screen_height=height,
+                screen_width=width,
+                include_replies=True,
+            )
+        comment_list = next((
+            item for item in nodes
+            if item.resource_id.endswith("/t73")
+            and "RecyclerView" in item.class_name
+        ), None)
+        if comment_list:
+            left, top, right, bottom = comment_list.bounds
+        else:
+            left, right = 0, width
+            top = round(height * self.COMMENT_VISIBLE_TOP_RATIO)
+            bottom = round(height * self.COMMENT_VISIBLE_BOTTOM_RATIO)
+        viewport_height = max(1, bottom - top)
+        x = left + (right - left) // 2
+        start_y = bottom - round(viewport_height * 0.10)
+
+        if not rows:
+            distance = max(1, round(viewport_height * 0.20))
+            self._fast_comment_swipe(x, start_y, x, start_y - distance)
+            sleep(0.6)
+            return True
+
+        anchor = max(rows, key=lambda item: (item.bounds or item.title_node.bounds)[3])
+        anchor_bounds = anchor.bounds or anchor.title_node.bounds
+        target_y = top + round(viewport_height * 0.15)
+        requested = anchor_bounds[1] - target_y
+        minimum = max(1, round(viewport_height * 0.18))
+        maximum = max(minimum, round(viewport_height * 0.45))
+        distance = max(minimum, min(maximum, requested))
+        # Keep touch-down brief: a long gesture on TikTok comments opens the
+        # “发送给” share sheet instead of scrolling.
+        self._fast_comment_swipe(x, start_y, x, start_y - distance)
+        sleep(0.6)
+
+        after_nodes = self._nodes()
+        if self._send_to_marker(after_nodes):
+            self._dismiss_send_to_sheet(after_nodes)
+            after_nodes = self._nodes()
+        after_rows = self._visible_comment_entries(
+            after_nodes,
+            screen_height=height,
+            screen_width=width,
+            include_replies=True,
+        )
+        matches = [item for item in after_rows if item.key == anchor.key]
+        if matches:
+            new_top = min(
+                (item.bounds or item.title_node.bounds)[1] for item in matches
+            )
+            return abs(anchor_bounds[1] - new_top) >= max(
+                3, round(viewport_height * 0.01)
+            )
+
+        # Momentum occasionally moves farther than the gesture distance. Move
+        # back a little and require the overlap anchor to reappear; otherwise
+        # stopping is safer than silently skipping users.
+        reverse = max(1, round(viewport_height * 0.20))
+        reverse_start = top + round(viewport_height * 0.25)
+        self._fast_comment_swipe(
+            x, reverse_start, x, min(bottom, reverse_start + reverse)
+        )
+        sleep(0.6)
+        recovered_nodes = self._nodes()
+        if self._send_to_marker(recovered_nodes):
+            self._dismiss_send_to_sheet(recovered_nodes)
+            recovered_nodes = self._nodes()
+        recovered_rows = self._visible_comment_entries(
+            recovered_nodes,
+            screen_height=height,
+            screen_width=width,
+            include_replies=True,
+        )
+        if not any(item.key == anchor.key for item in recovered_rows):
+            raise WorkflowError(
+                "评论翻页后重叠锚点丢失，为避免遗漏用户已停止当前房间采集"
+            )
+        return True
+
+    def _fast_comment_swipe(
+        self, start_x: int, start_y: int, end_x: int, end_y: int
+    ) -> None:
+        """Move immediately, hold at the target for 0.5s, then release."""
+        device = getattr(self, "device", None)
+        touch = getattr(device, "touch", None)
+        if touch is not None:
+            touched = False
+            try:
+                touch.down(int(start_x), int(start_y))
+                touched = True
+                # Crossing the touch-slop immediately cancels TikTok's
+                # long-press detector. Holding only after reaching the target
+                # suppresses fling/inertia without opening “发送给”.
+                for step in range(1, 7):
+                    ratio = step / 6
+                    touch.move(
+                        round(start_x + (end_x - start_x) * ratio),
+                        round(start_y + (end_y - start_y) * ratio),
+                    )
+                sleep(0.5)
+            finally:
+                if touched:
+                    touch.up(int(end_x), int(end_y))
+            return
+
+        # Older/fallback devices without low-level touch injection still use
+        # a short native swipe rather than uiautomator2's slow interpolation.
+        adb = getattr(self, "adb", None)
+        serial = getattr(self, "serial", "")
+        if adb is not None and serial:
+            adb.shell(
+                serial,
+                [
+                    "input", "touchscreen", "swipe",
+                    str(int(start_x)), str(int(start_y)),
+                    str(int(end_x)), str(int(end_y)), "100",
+                ],
+                timeout=3,
+            )
+            return
+        # Unit-test/compatibility fallback when no ADB client is attached.
+        self.device.swipe(
+            start_x, start_y, end_x, end_y, duration=0.10
+        )
 
     def _collect_live_rooms(
         self,
@@ -686,7 +924,10 @@ class TikTokSearchWorkflow:
                 empty_result_pages += 1
                 if empty_result_pages >= 3:
                     break
-                self.device.swipe(540, 2050, 540, 650, duration=0.6)
+                self.device.swipe(
+                    self._sx(540), self._sy(2050),
+                    self._sx(540), self._sy(650), duration=0.6,
+                )
                 sleep(1.0)
                 result_slot = 0
                 continue
@@ -794,7 +1035,7 @@ class TikTokSearchWorkflow:
         while new_count < max_users and stagnant_pages < 3 and monotonic() < deadline:
             page_handles: list[str] = []
             row_y = panel_top + int(height * 0.16)
-            row_step = max(130, int(height * 0.071))
+            row_step = max(1, int(height * 0.071))
             # Process every visible user before scrolling again. The ranking
             # keeps its position after returning from a full profile; scrolling
             # before each row would collect only the first user of every page.
@@ -802,7 +1043,7 @@ class TikTokSearchWorkflow:
                 if new_count >= max_users or monotonic() >= deadline:
                     break
                 y = row_y + index * row_step
-                if y >= height - 90:
+                if y >= height - max(1, round(height * 90 / self.REFERENCE_HEIGHT)):
                     break
                 profile = self._read_live_rank_profile(int(width * 0.16), y)
                 if not profile or not profile.handle:
@@ -850,7 +1091,8 @@ class TikTokSearchWorkflow:
         # Move about three row-heights and intentionally keep one overlapping
         # user visible. Deduplication removes the overlap and prevents users
         # between two pages from being skipped.
-        start_y = min(height - 170, panel_top + int(height * 0.48))
+        bottom_margin = max(1, round(height * 170 / self.REFERENCE_HEIGHT))
+        start_y = min(height - bottom_margin, panel_top + int(height * 0.48))
         end_y = panel_top + int(height * 0.265)
         x = int(width * 0.78)
         self.device.swipe(x, start_y, x, end_y, duration=0.7)
@@ -996,8 +1238,35 @@ class TikTokSearchWorkflow:
                 values.append(value)
         return values[:3]
 
-    @staticmethod
-    def _visible_comment_entries(nodes: list[UINode]) -> list[CommentEntry]:
+    @classmethod
+    def _visible_comment_entries(
+        cls,
+        nodes: list[UINode],
+        screen_height: int = REFERENCE_HEIGHT,
+        screen_width: int | None = None,
+        include_replies: bool = False,
+    ) -> list[CommentEntry]:
+        screen_width = screen_width or max(
+            (item.bounds[2] for item in nodes), default=cls.REFERENCE_WIDTH
+        )
+        comment_list = next((
+            item for item in nodes
+            if item.resource_id.endswith("/t73")
+            and "RecyclerView" in item.class_name
+        ), None)
+        if comment_list:
+            list_left, visible_top, list_right, visible_bottom = comment_list.bounds
+        else:
+            list_left, list_right = 0, screen_width
+            visible_top = round(screen_height * cls.COMMENT_VISIBLE_TOP_RATIO)
+            visible_bottom = round(screen_height * cls.COMMENT_VISIBLE_BOTTOM_RATIO)
+        viewport_height = max(1, visible_bottom - visible_top)
+        bottom_guard = round(viewport_height * 0.03)
+        # A fully visible first row commonly starts exactly at RecyclerView.top.
+        # Adding a top guard incorrectly discarded that row.
+        usable_top = visible_top
+        usable_bottom = visible_bottom - bottom_guard
+
         grouped: dict[str, list[UINode]] = {}
         for item in nodes:
             if item.container_key:
@@ -1012,12 +1281,29 @@ class TikTokSearchWorkflow:
                 item for item in items
                 if item.resource_id.endswith("/ewn") and item.text.strip()
             ), None)
-            if title and comment and title.bounds[1] < 2200 and comment.bounds[1] >= 850:
+            if not title or not comment:
+                continue
+            row_bounds = title.container_bounds or (
+                min(title.bounds[0], comment.bounds[0]),
+                min(title.bounds[1], comment.bounds[1]),
+                max(title.bounds[2], comment.bounds[2]),
+                max(title.bounds[3], comment.bounds[3]),
+            )
+            if row_bounds[1] < usable_top or row_bounds[3] > usable_bottom:
+                continue
+            avatar = next((
+                item for item in items if item.resource_id.endswith("/bit")
+            ), None)
+            is_reply = cls._is_reply_comment_row(
+                title, avatar, list_left, max(1, list_right - list_left)
+            )
+            if include_replies or not is_reply:
                 grouped_entries.append(CommentEntry(
-                    title.text.strip(), comment.text.strip(), title
+                    title.text.strip(), comment.text.strip(), title,
+                    row_bounds, is_reply,
                 ))
         if grouped_entries:
-            grouped_entries.sort(key=lambda item: item.title_node.bounds[1])
+            grouped_entries.sort(key=lambda item: (item.bounds or item.title_node.bounds)[1])
             return grouped_entries
 
         # Compatibility fallback for captured/test hierarchies without parent
@@ -1027,8 +1313,8 @@ class TikTokSearchWorkflow:
                 item for item in nodes
                 if item.resource_id.endswith("/title")
                 and item.text.strip()
-                and item.bounds[1] >= 850
-                and item.bounds[1] < 2200
+                and item.bounds[1] >= visible_top
+                and item.bounds[1] < visible_bottom
             ),
             key=lambda item: item.bounds[1],
         )
@@ -1037,21 +1323,60 @@ class TikTokSearchWorkflow:
                 item for item in nodes
                 if item.resource_id.endswith("/ewn")
                 and item.text.strip()
-                and item.bounds[1] >= 850
-                and item.bounds[1] < 2200
+                and item.bounds[1] >= visible_top
+                and item.bounds[1] < visible_bottom
             ),
             key=lambda item: item.bounds[1],
         )
         result: list[CommentEntry] = []
         for index, title in enumerate(titles):
-            next_top = titles[index + 1].bounds[1] if index + 1 < len(titles) else 2200
+            next_top = (
+                titles[index + 1].bounds[1]
+                if index + 1 < len(titles) else visible_bottom
+            )
             comment = next((
                 item for item in comments
                 if item.bounds[1] >= title.bounds[3] and item.bounds[1] < next_top
             ), None)
             if comment:
-                result.append(CommentEntry(title.text.strip(), comment.text.strip(), title))
+                is_reply = cls._is_reply_comment_row(
+                    title, None, list_left, max(1, list_right - list_left)
+                )
+                if include_replies or not is_reply:
+                    result.append(CommentEntry(
+                        title.text.strip(), comment.text.strip(), title,
+                        (
+                            min(title.bounds[0], comment.bounds[0]),
+                            title.bounds[1],
+                            max(title.bounds[2], comment.bounds[2]),
+                            comment.bounds[3],
+                        ),
+                        is_reply,
+                    ))
         return result
+
+    @staticmethod
+    def _is_reply_comment_row(
+        title: UINode,
+        avatar: UINode | None,
+        list_left: int,
+        list_width: int,
+    ) -> bool:
+        """Classify indented reply rows without relying on absolute pixels."""
+        parent_class = title.container_parent_class.rsplit(".", 1)[-1]
+        title_indent = (title.bounds[0] - list_left) / max(1, list_width)
+        if parent_class == "LinearLayout" and title_indent < 0.20:
+            return False
+        if parent_class == "FrameLayout" and title_indent >= 0.20:
+            return True
+        if title_indent >= 0.205:
+            return True
+        if avatar is not None:
+            avatar_indent = (avatar.bounds[0] - list_left) / max(1, list_width)
+            avatar_width = (avatar.bounds[2] - avatar.bounds[0]) / max(1, list_width)
+            if avatar_indent >= 0.10 and avatar_width <= 0.075:
+                return True
+        return False
 
     def _read_profile_info(self, title_node: UINode) -> ProfileInfo | None:
         opened_profile = False
@@ -1068,6 +1393,7 @@ class TikTokSearchWorkflow:
                 if any(
                     "发送给" in (item.text + item.description) for item in nodes
                 ):
+                    self._dismiss_send_to_sheet(nodes)
                     return None
                 handle = next((
                     item.text.strip() for item in nodes
@@ -1078,7 +1404,7 @@ class TikTokSearchWorkflow:
                     handle = next((
                         item.text.strip() for item in nodes
                         if self._valid_handle(item.text.strip())
-                        and item.bounds[1] < 900
+                        and item.bounds[1] < self._sy(900)
                     ), "")
                 if handle:
                     # Wait for asynchronously loaded profile counters, then
@@ -1135,6 +1461,10 @@ class TikTokSearchWorkflow:
     def _ensure_comment_page(self) -> None:
         for _ in range(3):
             nodes = self._nodes()
+            if self._send_to_marker(nodes):
+                self._dismiss_send_to_sheet(nodes)
+                sleep(0.4)
+                continue
             if any(
                 item.resource_id.endswith("/ed5") or item.resource_id.endswith("/vjb")
                 for item in nodes
@@ -1145,6 +1475,32 @@ class TikTokSearchWorkflow:
             self.device.press("back")
             sleep(0.8)
         raise WorkflowError("无法返回视频评论区，已停止采集以避免误操作")
+
+    @staticmethod
+    def _send_to_marker(nodes: list[UINode]) -> UINode | None:
+        return next((
+            item for item in nodes
+            if "发送给" in (item.text + item.description)
+        ), None)
+
+    def _dismiss_send_to_sheet(self, nodes: list[UINode] | None = None) -> bool:
+        """Dismiss TikTok's accidental long-press share sheet via blank space."""
+        current_nodes = nodes if nodes is not None else self._nodes()
+        marker = self._send_to_marker(current_nodes)
+        if marker is None:
+            return False
+        width, height = self._screen_size()
+        # Tap above the sheet title, constrained to the upper blank/video area.
+        blank_y = marker.bounds[1] - round(height * 0.08)
+        blank_y = max(round(height * 0.10), min(round(height * 0.35), blank_y))
+        self.device.click(width // 2, blank_y)
+        deadline = monotonic() + 3
+        while monotonic() < deadline:
+            self._check_cancelled()
+            if self._send_to_marker(self._nodes()) is None:
+                return True
+            sleep(0.25)
+        raise WorkflowError("检测到“发送给”弹窗，但点击上方空白处后未能关闭")
 
     @staticmethod
     def _single_line(value: str) -> str:
@@ -1200,11 +1556,23 @@ class TikTokSearchWorkflow:
             if not bounds:
                 continue
             container_key = ""
+            container_bounds = None
+            container_parent_class = ""
+            container_parent_resource = ""
             parent = parents.get(element)
             while parent is not None:
                 parent_resource = parent.attrib.get("resource-id", "")
                 if parent_resource.endswith(("/etr", "/t70")):
                     container_key = parent.attrib.get("bounds", "")
+                    container_bounds = self._parse_bounds(container_key)
+                    container_parent = parents.get(parent)
+                    if container_parent is not None:
+                        container_parent_class = container_parent.attrib.get(
+                            "class", ""
+                        )
+                        container_parent_resource = container_parent.attrib.get(
+                            "resource-id", ""
+                        )
                     break
                 parent = parents.get(parent)
             result.append(UINode(
@@ -1216,6 +1584,9 @@ class TikTokSearchWorkflow:
                 selected=element.attrib.get("selected") == "true",
                 bounds=bounds,
                 container_key=container_key,
+                container_bounds=container_bounds,
+                container_parent_class=container_parent_class,
+                container_parent_resource=container_parent_resource,
             ))
         return result
 

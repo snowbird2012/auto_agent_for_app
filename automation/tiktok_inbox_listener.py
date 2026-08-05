@@ -10,6 +10,7 @@ import uiautomator2 as u2
 from automation.tiktok_message_workflow import TikTokMessageWorkflow
 from automation.tiktok_search_workflow import (
     ProgressCallback,
+    TikTokSearchWorkflow,
     UINode,
     WorkflowCancelled,
     WorkflowError,
@@ -29,6 +30,7 @@ class TikTokInboxListener(TikTokMessageWorkflow):
             self._resolve_package()
             if self.device is None:
                 self.device = u2.connect(self.serial)
+            self._capture_screen_size()
             self._return_to_tiktok_home()
             self._emit(progress, "LISTEN_INBOX", "正在首页监听收件箱红色角标", 100)
             deadline = (
@@ -112,7 +114,8 @@ class TikTokInboxListener(TikTokMessageWorkflow):
             nodes = self._nodes()
             if self._has_chat_input(nodes):
                 return
-            first = self._first_conversation_node(nodes)
+            _, screen_height = self._screen_size()
+            first = self._first_conversation_node(nodes, screen_height)
             if not first:
                 if attempt > 1:
                     self._emit(
@@ -161,12 +164,17 @@ class TikTokInboxListener(TikTokMessageWorkflow):
         )
 
     @staticmethod
-    def _first_conversation_node(nodes: list[UINode]) -> UINode | None:
+    def _first_conversation_node(
+        nodes: list[UINode],
+        screen_height: int = TikTokSearchWorkflow.REFERENCE_HEIGHT,
+    ) -> UINode | None:
+        top = round(screen_height * 220 / TikTokSearchWorkflow.REFERENCE_HEIGHT)
+        bottom = round(screen_height * 1000 / TikTokSearchWorkflow.REFERENCE_HEIGHT)
         candidates = [
             item for item in nodes
             if item.clickable
             and item.resource_id.endswith("/v15")
-            and 220 <= item.bounds[1] < 1000
+            and top <= item.bounds[1] < bottom
         ]
         return min(candidates, key=lambda item: item.bounds[1]) if candidates else None
 
@@ -265,9 +273,9 @@ class TikTokInboxListener(TikTokMessageWorkflow):
             x = (left + right) // 2
             self.device.swipe(
                 x,
-                top + max(120, int((bottom - top) * 0.28)),
+                top + max(self._sy(120), int((bottom - top) * 0.28)),
                 x,
-                bottom - max(80, int((bottom - top) * 0.08)),
+                bottom - max(self._sy(80), int((bottom - top) * 0.08)),
                 duration=0.35,
             )
             sleep(0.55)
