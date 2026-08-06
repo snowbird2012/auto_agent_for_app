@@ -19,6 +19,14 @@ from automation.tiktok_search_workflow import (
 class TikTokMessageWorkflow(TikTokSearchWorkflow):
     """Search an exact TikTok handle, open its chat, and send one message."""
 
+    USER_RESULT_NAME_SUFFIXES = (
+        "/tv_username",
+        "/user_name",
+        "/title",
+        "/tv_name",
+        "/nickname",
+    )
+
     def run_message(
         self,
         handle: str,
@@ -51,7 +59,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
             self._verify_profile(normalized)
 
             self._emit(progress, "OPEN_MESSAGE", "正在打开用户私信页面", 72)
-            self._open_message_page(normalized)
+            self._open_message_page()
             self._emit(progress, "SEND_MESSAGE", f"正在发送消息：{message}", 84)
             self._send_chat_message(message)
             self._emit(progress, "MESSAGE_SENT", f"已向 {normalized} 发送消息：{message}", 92)
@@ -86,6 +94,11 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
             if unicodedata.category(character) != "Cf"
         )
 
+    @classmethod
+    def _handle_key(cls, value: str) -> str:
+        """Return the comparable username used by result lists (without @)."""
+        return cls._clean_handle(value).removeprefix("@").casefold()
+
     def _open_users_category(self) -> None:
         deadline = monotonic() + 12
         while monotonic() < deadline:
@@ -109,7 +122,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
         raise WorkflowError("搜索结果中没有找到“用户”分类")
 
     def _open_exact_user(self, handle: str) -> None:
-        target = handle.lstrip("@").casefold()
+        target = self._handle_key(handle)
         deadline = monotonic() + 15
         while monotonic() < deadline:
             self._check_cancelled()
@@ -119,8 +132,8 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
                 width, _ = self.device.window_size()
                 self.device.click(width // 2, match.center[1])
                 self._wait_node(
-                    lambda item: item.text.startswith("@")
-                    and self._clean_handle(item.text).lstrip("@").casefold() == target
+                    lambda item: self._clean_handle(item.text).startswith("@")
+                    and self._handle_key(item.text) == target
                     and not item.resource_id.endswith("/hgt"),
                     12,
                 )
@@ -130,97 +143,100 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
 
     @classmethod
     def _exact_result_node(cls, nodes: list[UINode], target: str) -> UINode | None:
-        matches = [
+        """Match either name shown in one user result record."""
+        target_key = cls._handle_key(target)
+        anchors = [
             item for item in nodes
-            if item.resource_id.endswith("/tv_username")
-            and cls._clean_handle(item.text).lstrip("@").casefold() == target
+            if item.resource_id.endswith("/tv_username") and item.text.strip()
         ]
-        return min(matches, key=lambda item: item.bounds[1]) if matches else None
+        matched_rows: list[UINode] = []
+        candidates = [
+            item for item in nodes
+            if item.text.strip()
+            and not item.resource_id.endswith("/hgt")
+            and cls._handle_key(item.text) == target_key
+        ]
+        for candidate in candidates:
+            if not anchors:break
+            anchor=min(anchors,key=lambda item:abs(item.center[1]-candidate.center[1]))
+            same_container=(bool(anchor.container_key) and anchor.container_key==candidate.container_key)
+            anchor_height=max(1,anchor.bounds[3]-anchor.bounds[1])
+            candidate_height=max(1,candidate.bounds[3]-candidate.bounds[1])
+            same_row=abs(anchor.center[1]-candidate.center[1]) <= max(80,anchor_height*3,candidate_height*3)
+            if same_container or same_row:matched_rows.append(anchor)
+        if matched_rows:return min(matched_rows,key=lambda item:item.bounds[1])
+
+        # Fallback for UI variants that do not expose the username anchor.
+        matches=[item for item in nodes
+                 if item.resource_id.endswith(cls.USER_RESULT_NAME_SUFFIXES)
+                 and cls._handle_key(item.text)==target_key]
+        return min(matches,key=lambda item:item.bounds[1]) if matches else None
 
     def _verify_profile(self, handle: str) -> None:
-        target = handle.lstrip("@").casefold()
+        target = self._handle_key(handle)
         profile_handle = self._find_first(
-            lambda item: item.text.startswith("@")
-            and self._clean_handle(item.text).lstrip("@").casefold() == target
+            lambda item: self._clean_handle(item.text).startswith("@")
+            and self._handle_key(item.text) == target
             and not item.resource_id.endswith("/hgt")
         )
         if not profile_handle:
             raise WorkflowError(f"用户主页校验失败，未进入 {handle}")
 
-    def _open_message_page(self, handle: str) -> None:
-        message_node = self._wait_node(
-            lambda item: item.text == "消息" and item.bounds[1] > self._sy(400),
-            10,
-        )
+    def _open_message_page(self) -> None:
+        message_node = self._wait_message_action(10)
         self.device.click(*message_node.center)
         self._wait_node(
             lambda item: item.class_name == "android.widget.EditText"
             and not item.resource_id.endswith("/hgt"),
             12,
         )
-        self._scroll_chat_to_top(handle)
 
-    def _scroll_chat_to_top(self, handle: str) -> None:
-        """Find the full handle, scrolling toward the chat top at most five times."""
-        target = handle.lstrip("@").casefold()
-        for _ in range(5):
+    def _wait_message_action(self, timeout: float) -> UINode:
+        deadline=monotonic()+timeout
+        while monotonic()<deadline:
             self._check_cancelled()
-            nodes = self._nodes()
-            if self._has_exact_handle(nodes, target):
-                return
-            chat_list = next(
-                (
-                    item for item in nodes
-                    if item.resource_id.endswith("/t70")
-                    and "RecyclerView" in item.class_name
-                ),
-                None,
+            node=self._message_action_node(
+                self._nodes(),self._sy(300),self._sy(1900)
             )
-            if not chat_list:
-                raise WorkflowError("没有找到私信消息列表")
-            before = self._chat_fingerprint(nodes, chat_list.bounds)
-            left, top, right, bottom = chat_list.bounds
-            x = (left + right) // 2
-            start_y = top + max(self._sy(120), int((bottom - top) * 0.28))
-            end_y = bottom - max(self._sy(80), int((bottom - top) * 0.08))
-            self.device.swipe(x, start_y, x, end_y, duration=0.35)
-            sleep(0.65)
-            after_nodes = self._nodes()
-            if self._has_exact_handle(after_nodes, target):
-                return
-            after = self._chat_fingerprint(after_nodes, chat_list.bounds)
-            if after == before:
-                raise WorkflowError(
-                    f"私信页面已到顶部，但没有找到完整用户名：{handle}"
-                )
-        raise WorkflowError(f"私信页面滚动5次后仍未找到完整用户名：{handle}")
-
-    @classmethod
-    def _has_exact_handle(cls, nodes: list[UINode], target: str) -> bool:
-        return any(
-            cls._clean_handle(item.text).startswith("@")
-            and cls._clean_handle(item.text).lstrip("@").casefold() == target
-            and not item.resource_id.endswith("/hgt")
-            for item in nodes
-        )
+            if node:return node
+            sleep(0.4)
+        raise WorkflowError("用户主页没有找到“消息”按钮")
 
     @staticmethod
-    def _chat_fingerprint(
-        nodes: list[UINode], bounds: tuple[int, int, int, int]
-    ) -> tuple[tuple[str, str, str, tuple[int, int, int, int]], ...]:
-        left, top, right, bottom = bounds
-        return tuple(
-            (item.text, item.description, item.resource_id, item.bounds)
-            for item in nodes
-            if item.bounds[0] >= left
-            and item.bounds[2] <= right
-            and item.bounds[1] >= top
-            and item.bounds[3] <= bottom
-            and (item.text or item.description)
-        )
+    def _message_action_node(
+        nodes: list[UINode], minimum_top: int = 0, maximum_bottom: int = 10_000
+    ) -> UINode | None:
+        labels=[item for item in nodes
+                if (item.text.strip()=="消息" or item.description.strip()=="消息")
+                and item.class_name!="android.widget.EditText"
+                and item.bounds[1]>=minimum_top and item.bounds[3]<=maximum_bottom]
+        actions: list[tuple[UINode,UINode]]=[]
+        for label_node in labels:
+            if label_node.clickable:
+                actions.append((label_node,label_node)); continue
+            x,y=label_node.center
+            containers=[item for item in nodes
+                        if item.clickable and item.area>=label_node.area
+                        and item.bounds[0]<=x<=item.bounds[2]
+                        and item.bounds[1]<=y<=item.bounds[3]]
+            action=min(containers,key=lambda item:item.area) if containers else label_node
+            actions.append((label_node,action))
+        if not actions:return None
+        actions.sort(key=lambda pair:(pair[0].bounds[1],pair[0].bounds[0]))
+        return actions[0][1]
 
     def _send_chat_message(self, message: str) -> None:
-        before_count = sum(1 for item in self._nodes() if item.text == message)
+        before_nodes=self._nodes()
+        screen_width=max(1,self._screen_width)
+        before_outgoing={
+            self._message_node_fingerprint(item)
+            for item in self._matching_outgoing_nodes(before_nodes,message,screen_width)
+        }
+        before_bottom=max(
+            (item.bounds[3] for item in self._matching_outgoing_nodes(
+                before_nodes,message,screen_width
+            )),default=None,
+        )
         field = self.device(className="android.widget.EditText")
         if not field.wait(timeout=8):
             raise WorkflowError("没有找到私信输入框")
@@ -234,23 +250,67 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
         )
         self.device.click(*send.center)
         deadline = monotonic() + 12
+        cleared_checks=0
         while monotonic() < deadline:
             self._check_cancelled()
             nodes = self._nodes()
-            count = sum(1 for item in nodes if item.text == message)
-            input_node = next(
-                (
-                    item for item in nodes
-                    if item.class_name == "android.widget.EditText"
-                    and not item.resource_id.endswith("/hgt")
-                ),
-                None,
+            input_nodes=[item for item in nodes
+                         if item.class_name=="android.widget.EditText"
+                         and not item.resource_id.endswith("/hgt")]
+            node_contains=any(
+                self._message_text_key(item.text)==self._message_text_key(message)
+                for item in input_nodes
             )
-            input_cleared = input_node is not None and input_node.text.strip() != message
-            if count > before_count and input_cleared:
-                return
+            try:live_text=str(field.get_text() or "")
+            except Exception:live_text=""
+            live_contains=(
+                self._message_text_key(live_text)==self._message_text_key(message)
+            )
+            if not node_contains and not live_contains:
+                cleared_checks+=1
+                if cleared_checks>=2:return
+            else:
+                cleared_checks=0
+            outgoing=self._matching_outgoing_nodes(nodes,message,screen_width)
+            for item in outgoing:
+                is_new=self._message_node_fingerprint(item) not in before_outgoing
+                remains_latest=(
+                    before_bottom is None
+                    or item.bounds[3]>=before_bottom-max(4,self._sy(8))
+                )
+                if is_new and remains_latest:return
             sleep(0.5)
         raise WorkflowError("点击发送后未确认到新消息")
+
+    @classmethod
+    def _message_text_key(cls,value: str) -> str:
+        cleaned=cls._clean_handle(value).replace("\r\n","\n").replace("\r","\n")
+        return " ".join(cleaned.split())
+
+    @classmethod
+    def _matching_outgoing_nodes(
+        cls,nodes: list[UINode],message: str,screen_width: int
+    ) -> list[UINode]:
+        target=cls._message_text_key(message)
+        matches=[
+            item for item in nodes
+            if target
+            and item.class_name!="android.widget.EditText"
+            and item.center[0]>=screen_width//2
+            and target in {
+                cls._message_text_key(item.text),
+                cls._message_text_key(item.description),
+            }
+        ]
+        return sorted(matches,key=lambda item:item.bounds[3])
+
+    @classmethod
+    def _message_node_fingerprint(cls,item: UINode) -> tuple:
+        return (
+            item.resource_id,item.bounds,
+            cls._message_text_key(item.text),
+            cls._message_text_key(item.description),
+        )
 
     def send_current_chat_message(self, message: str, progress: ProgressCallback) -> None:
         message = str(message).strip()

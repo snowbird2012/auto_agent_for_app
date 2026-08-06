@@ -309,6 +309,7 @@ class AutomationTasksWidget(QWidget):
         self.debug_job_id: int | None = None
         self.listen_worker: InboxListenWorker | None = None
         self.listen_job_id: int | None = None
+        self.listen_only_mode = False
         self.listen_stopping = False
         self._build_ui()
         self.refresh_devices()
@@ -376,6 +377,9 @@ class AutomationTasksWidget(QWidget):
         self.debug_button = QPushButton("调试任务")
         self.debug_button.clicked.connect(self.toggle_debug)
         controls.addWidget(self.debug_button)
+        self.listen_only_button = QPushButton("仅监听")
+        self.listen_only_button.clicked.connect(self.toggle_listen_only)
+        controls.addWidget(self.listen_only_button)
         list_layout.addLayout(controls)
         splitter.addWidget(list_card)
 
@@ -550,6 +554,7 @@ class AutomationTasksWidget(QWidget):
             self.stop_button.setEnabled(False)
             self.delete_button.setEnabled(False)
             self.debug_button.setEnabled(False)
+            self.listen_only_button.setEnabled(False)
             return
         timezone_name = self.settings_repository.get_timezone()
         logs = self.repository.list_logs(job_id)
@@ -565,7 +570,11 @@ class AutomationTasksWidget(QWidget):
         automating = self.debug_worker is not None or self.listen_worker is not None
         self.start_button.setEnabled(not running and not automating)
         listening = self.listen_worker is not None and self.listen_job_id == job_id
-        self.stop_button.setEnabled((running or listening) and not self.listen_stopping)
+        normal_listening=listening and not self.listen_only_mode
+        self.stop_button.setEnabled(
+            ((running and not self.listen_only_mode) or normal_listening)
+            and not self.listen_stopping
+        )
         self.delete_button.setEnabled(not running and not automating)
         self.debug_handle.setEnabled(not automating)
         self.debug_button.setEnabled(
@@ -573,6 +582,14 @@ class AutomationTasksWidget(QWidget):
             and (
                 self.debug_worker is None
                 or self.debug_job_id == job_id
+            )
+            and not self.listen_stopping
+        )
+        self.listen_only_button.setEnabled(
+            self.debug_worker is None
+            and (
+                self.listen_worker is None
+                or (self.listen_only_mode and self.listen_job_id==job_id)
             )
             and not self.listen_stopping
         )
@@ -698,6 +715,47 @@ class AutomationTasksWidget(QWidget):
         self.debug_button.style().unpolish(self.debug_button)
         self.debug_button.style().polish(self.debug_button)
 
+    def toggle_listen_only(self) -> None:
+        if self.listen_worker is not None:
+            if not self.listen_only_mode or self.listen_job_id!=self.selected_job_id():return
+            job_id=int(self.listen_job_id)
+            self.repository.add_log(job_id,"[仅监听] 正在停止持续消息监听……")
+            self.listen_stopping=True
+            self.listen_only_button.setEnabled(False)
+            self.listen_only_button.setText("停止中…")
+            self.listen_worker.stop()
+            return
+        self.listen_only_selected()
+
+    def listen_only_selected(self) -> None:
+        if self.debug_worker is not None or self.listen_worker is not None:return
+        job_id=self.selected_job_id()
+        if job_id is None:
+            QMessageBox.information(self,"仅监听","请先选择一个自动化任务。"); return
+        if self.adb_client is None:
+            QMessageBox.warning(self,"无法监听","ADB 客户端不可用。"); return
+        job=self.repository.get_job(job_id)
+        if not job:
+            QMessageBox.warning(self,"无法监听","自动化任务不存在。"); return
+        serial=str(job.get("device_serial") or "")
+        if serial not in self.ready_devices:
+            QMessageBox.warning(self,"无法监听","任务所选设备当前未连接或未就绪。"); return
+        try:runtime=self._strategy_runtime(job)
+        except Exception as error:
+            QMessageBox.warning(self,"无法监听",str(error)); return
+        self.repository.add_log(
+            job_id,f"[仅监听] 使用设备 {serial} 直接监听收件箱，不执行主动发送"
+        )
+        self._launch_inbox_worker(job_id,serial,runtime,listen_only=True)
+        self._set_listen_only_button_running(True)
+        self.refresh_jobs(job_id)
+
+    def _set_listen_only_button_running(self,running: bool) -> None:
+        self.listen_only_button.setText("停止监听" if running else "仅监听")
+        self.listen_only_button.setObjectName("DebugStopButton" if running else "")
+        self.listen_only_button.style().unpolish(self.listen_only_button)
+        self.listen_only_button.style().polish(self.listen_only_button)
+
     def start_selected(self) -> None:
         if self.debug_worker is not None or self.listen_worker is not None:
             return
@@ -733,6 +791,11 @@ class AutomationTasksWidget(QWidget):
             runtime = self._strategy_runtime(job or {})
         except Exception as error:
             self.repository.fail_job(job_id, f"模型策略不可用：{error}"); return
+        self._launch_inbox_worker(job_id,serial,runtime,listen_only=False)
+
+    def _launch_inbox_worker(
+        self,job_id: int,serial: str,runtime: dict,listen_only: bool
+    ) -> None:
         self.listen_worker = InboxListenWorker(
             self.adb_client, serial, runtime, self.conversation_repository, job_id
         )
@@ -755,6 +818,7 @@ class AutomationTasksWidget(QWidget):
             lambda: self._listen_finished(job_id)
         )
         self.listen_job_id = job_id
+        self.listen_only_mode=listen_only
         self.listen_stopping = False
         self.listen_worker.start()
 
@@ -768,31 +832,36 @@ class AutomationTasksWidget(QWidget):
     def _listen_failed(self, job_id: int, error: str) -> None:
         self.repository.add_log(job_id, f"[消息监听失败] {error}", "ERROR")
         job = self.repository.get_job(job_id)
-        if job and job["status"] == "running":
+        if not self.listen_only_mode and job and job["status"] == "running":
             self.repository.fail_job(job_id, error)
         self.refresh_jobs(job_id)
 
     def _listen_cancelled(self, job_id: int, message: str) -> None:
         job = self.repository.get_job(job_id)
-        if job and job["status"] == "running":
+        if not self.listen_only_mode and job and job["status"] == "running":
             self.repository.stop_job(job_id)
-        self.repository.add_log(job_id, f"消息监听已由用户终止：{message}")
+        prefix="[仅监听] " if self.listen_only_mode else ""
+        self.repository.add_log(job_id, f"{prefix}消息监听已由用户终止：{message}")
         self.refresh_jobs(job_id)
 
     def _listen_finished(self, job_id: int) -> None:
         worker = self.listen_worker
+        was_listen_only=self.listen_only_mode
         self.listen_worker = None
         self.listen_job_id = None
+        self.listen_only_mode=False
         self.listen_stopping = False
         if worker:
             worker.deleteLater()
+        if was_listen_only:self._set_listen_only_button_running(False)
         self.refresh_jobs(job_id)
 
     def stop_selected(self) -> None:
         job_id = self.selected_job_id()
         if job_id is None:
             return
-        if self.listen_worker is not None and self.listen_job_id == job_id:
+        if (self.listen_worker is not None and self.listen_job_id == job_id
+                and not self.listen_only_mode):
             self.repository.add_log(job_id, "正在停止持续消息监听……")
             self.listen_stopping = True
             self.stop_button.setEnabled(False)

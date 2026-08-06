@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from time import monotonic, sleep
+import re
 import unicodedata
 
+import cv2
+import numpy as np
 import uiautomator2 as u2
 
 from automation.tiktok_message_workflow import TikTokMessageWorkflow
@@ -69,8 +72,14 @@ class TikTokInboxListener(TikTokMessageWorkflow):
             self.device.double_click(*current_inbox.center, 0.15)
             sleep(1.5)
 
-            self._emit(progress, "OPEN_UNREAD_CHAT", "正在进入第一条未读会话", 100)
-            self._open_first_chat_with_retry(progress)
+            self._emit(progress, "OPEN_UNREAD_CHAT", "正在识别并进入带红色未读标志的会话", 100)
+            if not self._open_unread_chat_with_retry(progress):
+                self._emit(
+                    progress,"INBOX_NO_UNREAD_ROW",
+                    "收件箱会话列表中没有检测到红色未读标志，返回首页继续监听",100,
+                )
+                self._return_to_tiktok_home()
+                return None
 
             deadline = monotonic() + 10
             record: dict | None = None
@@ -90,7 +99,7 @@ class TikTokInboxListener(TikTokMessageWorkflow):
                     break
                 sleep(0.5)
             if not record:
-                raise WorkflowError("进入第一条会话后没有读取到对方消息")
+                raise WorkflowError("进入未读会话后没有读取到对方消息")
             self._emit(
                 progress,
                 "INBOX_MESSAGE",
@@ -107,40 +116,41 @@ class TikTokInboxListener(TikTokMessageWorkflow):
                 raise WorkflowError(str(error) + suffix) from error
             raise WorkflowError(f"消息监听失败：{error}{suffix}") from error
 
-    def _open_first_chat_with_retry(self, progress: ProgressCallback) -> None:
-        """Retry the first inbox row while a transient message banner covers it."""
+    def _open_unread_chat_with_retry(self, progress: ProgressCallback) -> bool:
+        """Open the row carrying an unread marker; never assume a fixed row index."""
+        missing_checks=0
         for attempt in range(1, 13):
             self._check_cancelled()
             nodes = self._nodes()
             if self._has_chat_input(nodes):
-                return
-            _, screen_height = self._screen_size()
-            first = self._first_conversation_node(nodes, screen_height)
-            if not first:
-                if attempt > 1:
-                    self._emit(
-                        progress,
-                        "WAIT_INBOX_POPUP",
-                        f"顶部弹窗尚未消失，等待后重试（{attempt}/12）",
-                        100,
-                    )
-                sleep(1)
+                return True
+            screen_width,screen_height=self._screen_size()
+            try:image=self.adb.screenshot(self.serial)
+            except Exception:image=None
+            unread=self._unread_conversation_node(
+                nodes,screen_width,screen_height,image
+            )
+            if not unread:
+                missing_checks+=1
+                if missing_checks>=2:return False
+                sleep(0.8)
                 continue
-            self.device.click(*first.center)
+            missing_checks=0
+            self.device.click(*unread.center)
             deadline = monotonic() + 2
             while monotonic() < deadline:
                 self._check_cancelled()
                 if self._has_chat_input(self._nodes()):
-                    return
+                    return True
                 sleep(0.25)
             self._emit(
                 progress,
                 "WAIT_INBOX_POPUP",
-                f"第一条会话被弹窗遮挡，准备再次点击（{attempt}/12）",
+                f"未读会话可能被顶部弹窗遮挡，准备再次识别并点击（{attempt}/12）",
                 100,
             )
             sleep(0.8)
-        raise WorkflowError("循环点击第一条会话12次后仍未进入聊天页面")
+        raise WorkflowError("循环识别并点击未读会话12次后仍未进入聊天页面")
 
     @staticmethod
     def _inbox_node(nodes: list[UINode]) -> UINode | None:
@@ -164,19 +174,107 @@ class TikTokInboxListener(TikTokMessageWorkflow):
         )
 
     @staticmethod
-    def _first_conversation_node(
+    def _conversation_nodes(
         nodes: list[UINode],
+        screen_width: int = TikTokSearchWorkflow.REFERENCE_WIDTH,
         screen_height: int = TikTokSearchWorkflow.REFERENCE_HEIGHT,
-    ) -> UINode | None:
-        top = round(screen_height * 220 / TikTokSearchWorkflow.REFERENCE_HEIGHT)
-        bottom = round(screen_height * 1000 / TikTokSearchWorkflow.REFERENCE_HEIGHT)
-        candidates = [
+    ) -> list[UINode]:
+        top=round(screen_height*0.08); bottom=round(screen_height*0.88)
+        minimum_width=round(screen_width*0.55)
+        rows=[
             item for item in nodes
             if item.clickable
             and item.resource_id.endswith("/v15")
             and top <= item.bounds[1] < bottom
+            and item.bounds[2]-item.bounds[0]>=minimum_width
         ]
-        return min(candidates, key=lambda item: item.bounds[1]) if candidates else None
+        return sorted(rows,key=lambda item:item.bounds[1])
+
+    @classmethod
+    def _unread_conversation_node(
+        cls,nodes: list[UINode],screen_width: int,screen_height: int,
+        image: np.ndarray | None = None,
+    ) -> UINode | None:
+        rows=cls._conversation_nodes(nodes,screen_width,screen_height)
+        for row in rows:
+            if cls._row_has_accessible_unread_marker(nodes,row):return row
+            if image is not None and cls._row_has_red_marker(image,row.bounds):return row
+        return None
+
+    @staticmethod
+    def _row_has_accessible_unread_marker(nodes: list[UINode],row: UINode) -> bool:
+        left,top,right,bottom=row.bounds
+        row_width=max(1,right-left); row_height=max(1,bottom-top); row_area=max(1,row.area)
+        keywords=(
+            "未读","新消息","条新信息","unread","new message","new messages",
+            "notification","badge","tin nhắn mới",
+        )
+        resource_keywords=("unread","badge","notice","notification","new_message")
+
+        # Some TikTok builds expose the whole row as one accessibility node,
+        # with the unread state included in its content-desc.
+        row_semantics=f"{row.text} {row.description}".strip().casefold()
+        if any(keyword in row_semantics for keyword in keywords):return True
+
+        # Badges often overlap the row edge. Expand the association rectangle
+        # proportionally instead of requiring the marker to be fully inside.
+        horizontal_padding=int(row_width*0.06)
+        vertical_padding=int(row_height*0.20)
+        for item in nodes:
+            if item is row:continue
+            x,y=item.center
+            if not (left-horizontal_padding<=x<=right+horizontal_padding
+                    and top-vertical_padding<=y<=bottom+vertical_padding):continue
+            semantics=f"{item.text} {item.description}".strip().casefold()
+            resource=item.resource_id.casefold()
+            if any(keyword in semantics for keyword in keywords):return True
+            if any(keyword in resource for keyword in resource_keywords):return True
+            badge_value=(item.text.strip() or item.description.strip()).strip()
+            numeric_badge=bool(re.fullmatch(r"\d{1,3}\+?",badge_value))
+            dot_badge=badge_value in {"•","●","·"}
+            if ((numeric_badge or dot_badge)
+                    and x>=left+int(row_width*0.48)
+                    and item.area<=row_area*0.24):return True
+        return False
+
+    @staticmethod
+    def _row_has_red_marker(
+        image: np.ndarray,bounds: tuple[int,int,int,int]
+    ) -> bool:
+        if image.ndim!=3 or image.shape[2]<3:return False
+        height,width=image.shape[:2]
+        left,top,right,bottom=bounds
+        left=max(0,min(width,left)); right=max(0,min(width,right))
+        top=max(0,min(height,top)); bottom=max(0,min(height,bottom))
+        if right<=left or bottom<=top:return False
+        row_width=right-left; row_height=bottom-top
+        # Badge placement differs across resolutions and TikTok builds. Scan
+        # most of the row while excluding only the avatar area on the left.
+        crop=image[top:bottom,left+int(row_width*0.28):right]
+        if crop.size==0:return False
+        hsv=cv2.cvtColor(crop[:,:,:3],cv2.COLOR_BGR2HSV)
+        low=cv2.inRange(hsv,np.array([0,90,80]),np.array([18,255,255]))
+        high=cv2.inRange(hsv,np.array([155,90,80]),np.array([179,255,255]))
+        mask=cv2.bitwise_or(low,high)
+        # Also accept red/pink pixels by channel dominance. This covers OEM
+        # color profiles that shift TikTok red outside the expected HSV range.
+        blue=crop[:,:,0].astype(np.int16)
+        green=crop[:,:,1].astype(np.int16)
+        red=crop[:,:,2].astype(np.int16)
+        dominant=((red>=90)&((red-green)>=28)&((red-blue)>=18)).astype(np.uint8)*255
+        mask=cv2.bitwise_or(mask,dominant)
+        count,_,stats,_=cv2.connectedComponentsWithStats(mask,8)
+        minimum=max(2,int(row_width*row_height*0.00002))
+        maximum=max(minimum,int(row_width*row_height*0.12))
+        for index in range(1,count):
+            component_width=int(stats[index,cv2.CC_STAT_WIDTH])
+            component_height=int(stats[index,cv2.CC_STAT_HEIGHT])
+            area=int(stats[index,cv2.CC_STAT_AREA])
+            if (minimum<=area<=maximum
+                    and 2<=component_width<=max(6,int(row_height*0.60))
+                    and 2<=component_height<=max(6,int(row_height*0.60))):
+                return True
+        return False
 
     @staticmethod
     def _has_chat_input(nodes: list[UINode]) -> bool:
