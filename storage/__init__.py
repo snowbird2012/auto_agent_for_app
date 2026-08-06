@@ -6,7 +6,8 @@ from storage.task_repository import TaskRepository
 from storage.user_repository import UserRepository
 from storage.message_strategy_repository import MessageStrategyRepository
 from storage.conversation_repository import ConversationRepository
+from storage.knowledge_repository import KnowledgeRepository
 
 __all__ = [
-    "AutomationJobRepository", "ConversationRepository", "MessageStrategyRepository", "SettingsRepository", "TaskRepository", "UserRepository"
+    "AutomationJobRepository", "ConversationRepository", "KnowledgeRepository", "MessageStrategyRepository", "SettingsRepository", "TaskRepository", "UserRepository"
 ]

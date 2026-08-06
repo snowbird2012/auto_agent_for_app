@@ -170,20 +170,43 @@ class ModelTestClient:
         return text
 
     def _embedding(self, provider: dict, model: dict, prompt: str, proxy_settings: dict | None) -> str:
+        vector = self.create_embeddings(
+            provider, model, [prompt.strip()], proxy_settings
+        )[0]
+        preview = vector[:24]
+        return f"向量维度：{len(vector)}\n前 {len(preview)} 维：\n" + json.dumps(preview, ensure_ascii=False)
+
+    def create_embeddings(
+        self,
+        provider: dict,
+        model: dict,
+        texts: list[str],
+        proxy_settings: dict | None = None,
+    ) -> list[list[float]]:
+        """Return numeric embeddings for indexing and retrieval."""
         if provider["api_protocol"] not in {"openai", "openai_compatible"}:
-            raise ModelTestError("当前仅支持通过 OpenAI 兼容接口测试向量模型")
+            raise ModelTestError("当前仅支持通过 OpenAI 兼容接口调用向量模型")
+        if not provider.get("api_key") or not provider.get("enabled"):
+            raise ModelTestError("向量模型厂家未启用或没有配置 API Key")
+        if model.get("model_type") != "embedding" or not model.get("enabled"):
+            raise ModelTestError("请选择已启用的向量模型")
+        clean = [str(item).strip() for item in texts if str(item).strip()]
+        if not clean:
+            raise ModelTestError("向量输入内容不能为空")
         url = provider["base_url"].rstrip("/") + "/embeddings"
         payload = dict(model.get("extra_json") or {})
-        payload.update({"model": model["model_id"], "input": prompt.strip()})
+        payload.update({"model": model["model_id"], "input": clean})
         with self._post(url, proxy_settings, headers=self._headers(provider), json=payload, timeout=(10, provider["timeout_seconds"])) as response:
             self._raise_for_status(response)
             data = response.json()
-        vectors = data.get("data") or []
-        if not vectors:
+        items = data.get("data") or []
+        if not items:
             raise ModelTestError("响应中没有向量数据")
-        vector = vectors[0].get("embedding") or []
-        preview = vector[:24]
-        return f"向量维度：{len(vector)}\n前 {len(preview)} 维：\n" + json.dumps(preview, ensure_ascii=False)
+        items = sorted(items, key=lambda item: int(item.get("index", 0)))
+        vectors = [item.get("embedding") or [] for item in items]
+        if len(vectors) != len(clean) or any(not vector for vector in vectors):
+            raise ModelTestError("向量返回数量或内容不正确")
+        return [[float(value) for value in vector] for vector in vectors]
 
     def _rerank(self, provider: dict, model: dict, prompt: str, proxy_settings: dict | None) -> str:
         if provider["api_protocol"] not in {"openai", "openai_compatible"}:

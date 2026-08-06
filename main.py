@@ -141,14 +141,19 @@ def main() -> int:
     return app.exec()
 
 
-if __name__ == "__main__":
+def run() -> int:
+    """Run the GUI with startup diagnostics for console and windowed launchers."""
     sys.excepthook = report_unhandled_exception
     try:
-        raise SystemExit(main())
+        return main()
     except SystemExit:
         raise
     except BaseException:
         error_type, error, error_traceback = sys.exc_info()
         assert error_type is not None and error is not None
         report_unhandled_exception(error_type, error, error_traceback)
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

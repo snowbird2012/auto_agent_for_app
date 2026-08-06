@@ -14,7 +14,9 @@ python -m pip install --upgrade -r requirements-ui.txt
 python -c "import cv2, numpy, PySide6, requests, uiautomator2; print('依赖安装成功'); print('OpenCV:', cv2.__version__); print('NumPy:', numpy.__version__); print('PySide6:', PySide6.__version__); print('Requests:', requests.__version__)"
 
 
-启动程序
-python main.py
+启动程序（只显示 UI，不显示命令行窗口）
+pythonw.exe AutoAgent.pyw
 
+需要查看控制台调试信息时使用：
+python.exe main.py
 

@@ -189,13 +189,27 @@ class SettingsRepository:
         with self._connect() as db:
             db.execute("DELETE FROM ai_providers WHERE id = ?", (provider_id,))
 
-    def list_models(self) -> list[dict[str, Any]]:
+    def list_models(
+        self, model_type: str | None = None, *, enabled_only: bool = False
+    ) -> list[dict[str, Any]]:
+        if model_type is not None and model_type not in MODEL_TYPES:
+            raise ValueError(f"不支持的模型类型：{model_type}")
+        conditions: list[str] = []
+        parameters: list[Any] = []
+        if model_type is not None:
+            conditions.append("m.model_type = ?")
+            parameters.append(model_type)
+        if enabled_only:
+            conditions.append("m.enabled = 1")
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         with self._connect() as db:
             rows = db.execute(
-                """SELECT m.*, p.name AS provider_name FROM ai_models m
+                f"""SELECT m.*, p.name AS provider_name FROM ai_models m
                 JOIN ai_providers p ON p.id=m.provider_id
+                {where_clause}
                 ORDER BY CASE m.model_type WHEN 'llm' THEN 1 WHEN 'embedding' THEN 2
-                WHEN 'rerank' THEN 3 ELSE 4 END, m.display_name"""
+                WHEN 'rerank' THEN 3 ELSE 4 END, m.display_name""",
+                parameters,
             ).fetchall()
         return [self._model_row(row) for row in rows]
 

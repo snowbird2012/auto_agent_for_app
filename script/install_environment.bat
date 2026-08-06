@@ -32,6 +32,7 @@ if not defined PYTHON_EXE goto python_not_found
 echo Python 3.14: %PYTHON_EXE%
 "%PYTHON_EXE%" --version
 if errorlevel 1 goto python_not_found
+for %%P in ("%PYTHON_EXE%") do set "PYTHONW_EXE=%%~dpPpythonw.exe"
 
 echo.
 echo [2/4] Initializing and upgrading pip...
@@ -55,7 +56,7 @@ echo ============================================================
 echo Installation completed successfully.
 echo Python: %PYTHON_EXE%
 echo Start command:
-echo "%PYTHON_EXE%" "%PROJECT_ROOT%\main.py"
+echo "%PYTHONW_EXE%" "%PROJECT_ROOT%\AutoAgent.pyw"
 echo ============================================================
 echo.
 pause

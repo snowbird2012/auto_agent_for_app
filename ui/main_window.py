@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from storage import AutomationJobRepository, ConversationRepository, MessageStrategyRepository
+from storage import AutomationJobRepository, ConversationRepository, KnowledgeRepository, MessageStrategyRepository
 from storage.settings_repository import SettingsRepository
 from storage.task_repository import TaskRepository
 from storage.user_repository import UserRepository
@@ -48,6 +48,7 @@ from ui.ai_settings_widget import AISettingsWidget
 from ui.automation_tasks_widget import AutomationTasksWidget
 from ui.message_strategy_widget import MessageStrategyWidget
 from ui.message_management_widget import MessageManagementWidget
+from ui.knowledge_management_widget import KnowledgeManagementWidget
 from ui.device_management_widget import DeviceManagementWidget
 from ui.proxy_settings_widget import ProxySettingsWidget
 from ui.task_center_widget import TaskCenterWidget
@@ -64,7 +65,7 @@ NAV_ITEMS = [
     "自动化任务",
     "消息策略",
     "消息管理",
-    "审核中心",
+    "知识库管理",
     "系统设置",
 ]
 
@@ -82,6 +83,7 @@ class MainWindow(QMainWindow):
         )
         self.message_strategy_repository = MessageStrategyRepository(self.settings_repository.database_path)
         self.conversation_repository = ConversationRepository(self.settings_repository.database_path)
+        self.knowledge_repository = KnowledgeRepository()
         # Keep the settings UI available even before ADB is installed/configured.
         self.adb_client = ADBClient(
             self.settings_repository.get_adb_path(), allow_missing=True
@@ -153,15 +155,21 @@ class MainWindow(QMainWindow):
             self.adb_client,
             self.message_strategy_repository,
             self.conversation_repository,
+            self.knowledge_repository,
         )
         self.device_page.devices_updated.connect(self.automation_page.update_devices)
         self.pages.addWidget(self._scroll_page(self.automation_page))
-        self.message_strategy_page = MessageStrategyWidget(self.message_strategy_repository,self.settings_repository)
+        self.message_strategy_page = MessageStrategyWidget(
+            self.message_strategy_repository,self.settings_repository,self.knowledge_repository
+        )
         self.pages.addWidget(self._scroll_page(self.message_strategy_page))
         self.message_page = MessageManagementWidget(self.conversation_repository,self.settings_repository)
         self.automation_page.messages_updated.connect(self.message_page.refresh)
         self.pages.addWidget(self._scroll_page(self.message_page))
-        self.pages.addWidget(self._scroll_page(self._review_page()))
+        self.knowledge_page = KnowledgeManagementWidget(
+            self.knowledge_repository, self.settings_repository
+        )
+        self.pages.addWidget(self._scroll_page(self.knowledge_page))
         self.pages.addWidget(self._scroll_page(self._settings_page()))
         content_layout.addWidget(self.pages, 1)
         layout.addWidget(content, 1)
@@ -247,6 +255,8 @@ class MainWindow(QMainWindow):
             self.message_strategy_page.refresh_all()
         elif index == 6 and hasattr(self, "message_page"):
             self.message_page.refresh()
+        elif index == 7 and hasattr(self, "knowledge_page"):
+            self.knowledge_page.refresh_all()
 
     @staticmethod
     def _scroll_page(content: QWidget) -> QScrollArea:
@@ -532,30 +542,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         return page
 
-    def _review_page(self) -> QWidget:
-        page, layout = self._page()
-        layout.addWidget(SectionHeader("审核中心", "确认高风险操作与低置信度模型建议"))
-        tabs = QTabWidget()
-        for title, count in [("待审核", 3), ("已通过", 18), ("已拒绝", 4)]:
-            tab = QWidget(); tab_layout = QVBoxLayout(tab); tab_layout.setContentsMargins(0, 14, 0, 0)
-            if title == "待审核":
-                for name, kind, reason, tone in [
-                    ("@maya_design", "首条私信", "高意向用户，模型建议发送产品价格与选型帮助。", "green"),
-                    ("@angry_customer", "敏感会话", "用户表达不满，建议转交人工处理。", "red"),
-                    ("@studio_partners", "合作咨询", "涉及商务合作条款，不允许模型自动承诺。", "orange"),
-                ]:
-                    item, item_layout = card_layout()
-                    top = QHBoxLayout(); top.addWidget(label(name, "SectionTitle")); top.addWidget(label(kind, {"green":"PillGreen","red":"PillRed","orange":"PillOrange"}[tone])); top.addStretch(); item_layout.addLayout(top)
-                    item_layout.addWidget(label(reason, "Muted"))
-                    actions = QHBoxLayout(); actions.addStretch(); reject = QPushButton("拒绝"); approve = QPushButton("批准"); approve.setObjectName("Primary"); actions.addWidget(reject); actions.addWidget(approve); item_layout.addLayout(actions)
-                    tab_layout.addWidget(item)
-            else:
-                tab_layout.addWidget(label(f"{title}记录共 {count} 条", "Muted"))
-                tab_layout.addStretch()
-            tabs.addTab(tab, f"{title}  {count}")
-        layout.addWidget(tabs)
-        return page
-
     def _settings_page(self) -> QWidget:
         page, layout = self._page()
         layout.addWidget(SectionHeader("系统设置", "配置多个 API 厂家、模型类型、自动化边界和消息推送"))
@@ -755,6 +741,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self.task_page.shutdown()
         self.automation_page.shutdown()
+        self.knowledge_page.shutdown()
         for worker in list(self.task_page.workers.values()):
             worker.wait(3_000)
         super().closeEvent(event)

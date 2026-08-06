@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,10 +29,12 @@ from automation import (
     WorkflowCancelled,
 )
 from devices import ADBClient, AndroidDevice
+from services.knowledge_service import KnowledgeService
 from services.message_strategy_service import MessageStrategyService
 from storage import (
     AutomationJobRepository,
     ConversationRepository,
+    KnowledgeRepository,
     MessageStrategyRepository,
     SettingsRepository,
     UserRepository,
@@ -67,6 +71,34 @@ def _strategy_message(messages: list[dict[str, str]]) -> str:
     return "\n".join(
         f"[{labels.get(item.get('type', 'text'), item.get('type', 'text'))}] {item['content']}"
         for item in messages
+    )
+
+
+def _evaluate_strategy(
+    runtime: dict,
+    user_message: str,
+    progress: Callable[[str, str, int], None],
+    cancelled: Callable[[], bool],
+) -> dict:
+    chunks: list[dict] = []
+    base_ids = list(runtime["strategy"].get("knowledge_base_ids") or [])
+    knowledge_service = runtime.get("knowledge_service")
+    if base_ids and knowledge_service is not None:
+        if cancelled():raise WorkflowCancelled("消息处理已停止")
+        progress("KNOWLEDGE_SEARCH",f"正在检索策略绑定的 {len(base_ids)} 个知识库",100)
+        retrieval=knowledge_service.search_many(base_ids,user_message)
+        chunks=retrieval["results"]
+        for error in retrieval["errors"]:
+            progress("KNOWLEDGE_WARNING",f'知识库“{error["name"]}”未参与回复：{error["error"]}',100)
+        if chunks:
+            names="、".join(dict.fromkeys(item["knowledge_base_name"] for item in chunks))
+            progress("KNOWLEDGE_MATCH",f"命中 {len(chunks)} 个知识片段，来源：{names}",100)
+        else:
+            progress("KNOWLEDGE_MISS","绑定的知识库没有命中相关内容，将按原策略回复",100)
+    progress("MODEL_ANALYZE",f'正在使用策略“{runtime["strategy"]["name"]}”分析消息并生成结构化回复',100)
+    return MessageStrategyService().evaluate(
+        runtime["strategy"],runtime["model"],runtime["provider"],user_message,
+        runtime["proxy"],cancelled=cancelled,knowledge_chunks=chunks,
     )
 
 
@@ -153,11 +185,9 @@ class MessageDebugWorker(QThread):
             self.workflow._return_to_tiktok_home()
             return
         user_message = _strategy_message(messages)
-        self._emit_progress("MODEL_ANALYZE", f"正在使用策略“{self.runtime['strategy']['name']}”分析 {len(messages)} 条新消息：{user_message}")
-        result = MessageStrategyService().evaluate(
-            self.runtime["strategy"], self.runtime["model"], self.runtime["provider"],
-            user_message, self.runtime["proxy"],
-            cancelled=lambda: self.workflow.cancel_event.is_set(),
+        result = _evaluate_strategy(
+            self.runtime,user_message,self._emit_progress,
+            lambda: self.workflow.cancel_event.is_set(),
         )
         self._emit_progress("MODEL_DECISION", f"结构化输出：need_reply={str(result['need_reply']).lower()}，content={result['content']}")
         if result["need_reply"]:
@@ -219,11 +249,10 @@ class InboxListenWorker(QThread):
                         self.workflow._return_to_tiktok_home()
                         continue
                     user_message = _strategy_message(messages)
-                    self.progress_changed.emit("MODEL_ANALYZE", f"正在使用策略“{self.runtime['strategy']['name']}”分析 {len(messages)} 条新消息：{user_message}", 100)
-                    result = MessageStrategyService().evaluate(
-                        self.runtime["strategy"], self.runtime["model"], self.runtime["provider"],
-                        user_message, self.runtime["proxy"],
-                        cancelled=lambda: self.workflow.cancel_event.is_set(),
+                    result = _evaluate_strategy(
+                        self.runtime,user_message,
+                        lambda step,text,percent:self.progress_changed.emit(step,text,percent),
+                        lambda: self.workflow.cancel_event.is_set(),
                     )
                     self.progress_changed.emit("MODEL_DECISION", f"结构化输出：need_reply={str(result['need_reply']).lower()}，content={result['content']}", 100)
                     if result["need_reply"]:
@@ -263,6 +292,7 @@ class AutomationTasksWidget(QWidget):
         adb_client: ADBClient | None = None,
         strategy_repository: MessageStrategyRepository | None = None,
         conversation_repository: ConversationRepository | None = None,
+        knowledge_repository: KnowledgeRepository | None = None,
     ) -> None:
         super().__init__()
         self.repository = repository
@@ -271,6 +301,7 @@ class AutomationTasksWidget(QWidget):
         self.adb_client = adb_client
         self.strategy_repository = strategy_repository
         self.conversation_repository = conversation_repository
+        self.knowledge_repository = knowledge_repository
         self.ready_devices: dict[str, AndroidDevice] = {}
         self._has_tags = False
         self._has_devices = False
@@ -784,8 +815,11 @@ class AutomationTasksWidget(QWidget):
             raise ValueError("策略绑定的大语言模型不可用")
         provider = self.settings_repository.get_provider(int(model["provider_id"]), reveal_key=True)
         if not provider or not provider["enabled"]: raise ValueError("模型所属API厂家不可用")
+        knowledge_service=(KnowledgeService(self.knowledge_repository,self.settings_repository)
+                           if self.knowledge_repository is not None else None)
         return {"strategy":strategy,"model":model,"provider":provider,
-                "proxy":self.settings_repository.get_proxy_settings(reveal_password=True)}
+                "proxy":self.settings_repository.get_proxy_settings(reveal_password=True),
+                "knowledge_service":knowledge_service}
 
     def _record_message(self, job_id: int, values: dict) -> None:
         if self.conversation_repository is None:
