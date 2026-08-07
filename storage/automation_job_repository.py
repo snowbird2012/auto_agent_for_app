@@ -160,6 +160,7 @@ class AutomationJobRepository:
                 raise ValueError("该任务尚未选择执行设备，请重新创建任务")
             db.execute(
                 """UPDATE automation_jobs SET status='running',error='',
+                completed_count=0,
                 started_at=CURRENT_TIMESTAMP,finished_at=NULL,
                 updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                 (int(job_id),),
@@ -167,6 +168,13 @@ class AutomationJobRepository:
             db.execute(
                 "INSERT INTO automation_job_logs(job_id,message) VALUES(?,?)",
                 (int(job_id), "自动化任务已启动"),
+            )
+
+    def update_completed_count(self,job_id: int,count: int) -> None:
+        with self._connect() as db:
+            db.execute(
+                """UPDATE automation_jobs SET completed_count=?,updated_at=CURRENT_TIMESTAMP
+                WHERE id=?""",(max(0,int(count)),int(job_id)),
             )
 
     def stop_job(self, job_id: int) -> None:

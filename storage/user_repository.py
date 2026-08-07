@@ -308,3 +308,20 @@ class UserRepository:
                 "UPDATE temporary_users SET first_message_sent=? WHERE id=?",
                 (1 if sent else 0, int(user_id)),
             )
+
+    def list_unsent_by_tag(self, tag: str, limit: int) -> list[dict[str, Any]]:
+        target=str(tag).strip().casefold()
+        if not target:return []
+        with self._connect() as db:
+            rows=db.execute(
+                """SELECT id,username,handle,tags_json FROM temporary_users
+                WHERE first_message_sent=0 AND handle<>''
+                ORDER BY last_seen_at DESC,id DESC"""
+            ).fetchall()
+        result=[]
+        for row in rows:
+            tags=self._tags(row["tags_json"])
+            if any(str(value).strip().casefold()==target for value in tags):
+                item=dict(row); item["tags"]=tags; item.pop("tags_json",None); result.append(item)
+                if len(result)>=max(1,int(limit)):break
+        return result

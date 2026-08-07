@@ -136,6 +136,11 @@ class TikTokInboxListener(TikTokMessageWorkflow):
                 sleep(0.8)
                 continue
             missing_checks=0
+            rows=self._conversation_nodes(nodes,screen_width,screen_height)
+            self._emit(
+                progress,"INBOX_UNREAD_ROW",
+                f"已定位未读会话：当前识别到 {len(rows)} 条会话，目标区域={unread.bounds}",100,
+            )
             self.device.click(*unread.center)
             deadline = monotonic() + 2
             while monotonic() < deadline:
@@ -396,6 +401,20 @@ class TikTokInboxListener(TikTokMessageWorkflow):
                 overlap = size
                 break
         return older_page + newer_page[overlap:]
+
+    @staticmethod
+    def _chat_fingerprint(
+        nodes: list[UINode],bounds: tuple[int,int,int,int]
+    ) -> tuple[tuple[str,str,str,tuple[int,int,int,int]],...]:
+        """Fingerprint the visible chat list to detect whether paging moved."""
+        left,top,right,bottom=bounds
+        return tuple(
+            (item.text,item.description,item.resource_id,item.bounds)
+            for item in nodes
+            if item.bounds[0]>=left and item.bounds[2]<=right
+            and item.bounds[1]>=top and item.bounds[3]<=bottom
+            and (item.text or item.description)
+        )
 
     @staticmethod
     def _text_message_type(content: str) -> str:

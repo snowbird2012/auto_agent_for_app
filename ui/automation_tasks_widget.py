@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from threading import Event
 from typing import Callable
 
 from PySide6.QtCore import QThread, Qt, Signal
@@ -224,48 +225,7 @@ class InboxListenWorker(QThread):
         try:
             screen_session = self.adb.begin_screen_awake(self.serial)
             self.workflow = TikTokInboxListener(self.adb, self.serial)
-            while True:
-                record = self.workflow.listen_once(
-                    lambda step, text, percent: self.progress_changed.emit(
-                        step, text, percent
-                    ),
-                    timeout=None,
-                )
-                if record:
-                    messages = _record_messages(record)
-                    if self.conversation_repository is not None:
-                        messages = self.conversation_repository.record_incoming_batch(
-                            display_name=record["sender"],
-                            messages=messages,
-                            job_id=self.job_id,
-                        )
-                        if messages:
-                            self.messages_updated.emit()
-                    else:
-                        for item in messages:
-                            self.message_recorded.emit({"handle":"","display_name":record["sender"],"direction":"inbound","message_kind":"received_"+item.get("type","text"),"content":item["content"]})
-                    if not messages:
-                        self.progress_changed.emit("MESSAGE_DUPLICATE", "本轮消息均已记录，返回首页继续监听", 100)
-                        self.workflow._return_to_tiktok_home()
-                        continue
-                    user_message = _strategy_message(messages)
-                    result = _evaluate_strategy(
-                        self.runtime,user_message,
-                        lambda step,text,percent:self.progress_changed.emit(step,text,percent),
-                        lambda: self.workflow.cancel_event.is_set(),
-                    )
-                    self.progress_changed.emit("MODEL_DECISION", f"结构化输出：need_reply={str(result['need_reply']).lower()}，content={result['content']}", 100)
-                    if result["need_reply"]:
-                        self.workflow.send_current_chat_message(
-                            result["content"],
-                            lambda step,text,percent: self.progress_changed.emit(step,text,percent),
-                        )
-                        self.message_recorded.emit({"handle":"","display_name":record["sender"],"direction":"outbound","message_kind":"model_reply","content":result["content"]})
-                    else:
-                        self.progress_changed.emit("MODEL_NO_REPLY", "模型判断无需回复，返回首页继续监听", 100)
-                self.progress_changed.emit(
-                    "LISTEN_CONTINUE", "本条消息读取完成，返回首页继续监听", 100
-                )
+            self._listen_forever()
         except WorkflowCancelled as error:
             self.cancelled.emit(str(error))
         except Exception as error:
@@ -278,6 +238,104 @@ class InboxListenWorker(QThread):
         finally:
             if screen_session is not None:
                 self.adb.end_screen_awake(self.serial, screen_session)
+
+    def _listen_forever(self) -> None:
+        while True:
+            record = self.workflow.listen_once(
+                lambda step,text,percent:self.progress_changed.emit(step,text,percent),
+                timeout=None,
+            )
+            if record:
+                messages=_record_messages(record)
+                if self.conversation_repository is not None:
+                    messages=self.conversation_repository.record_incoming_batch(
+                        display_name=record["sender"],messages=messages,job_id=self.job_id,
+                    )
+                    if messages:self.messages_updated.emit()
+                else:
+                    for item in messages:
+                        self.message_recorded.emit({"handle":"","display_name":record["sender"],"direction":"inbound","message_kind":"received_"+item.get("type","text"),"content":item["content"]})
+                if not messages:
+                    self.progress_changed.emit("MESSAGE_DUPLICATE","本轮消息均已记录，返回首页继续监听",100)
+                    self.workflow._return_to_tiktok_home(); continue
+                user_message=_strategy_message(messages)
+                result=_evaluate_strategy(
+                    self.runtime,user_message,
+                    lambda step,text,percent:self.progress_changed.emit(step,text,percent),
+                    lambda:self.workflow.cancel_event.is_set(),
+                )
+                self.progress_changed.emit("MODEL_DECISION",f"结构化输出：need_reply={str(result['need_reply']).lower()}，content={result['content']}",100)
+                if result["need_reply"]:
+                    self.workflow.send_current_chat_message(
+                        result["content"],
+                        lambda step,text,percent:self.progress_changed.emit(step,text,percent),
+                    )
+                    self.message_recorded.emit({"handle":"","display_name":record["sender"],"direction":"outbound","message_kind":"model_reply","content":result["content"]})
+                else:
+                    self.progress_changed.emit("MODEL_NO_REPLY","模型判断无需回复，返回首页继续监听",100)
+            self.progress_changed.emit("LISTEN_CONTINUE","本条消息读取完成，返回首页继续监听",100)
+
+
+class DialogAutomationWorker(InboxListenWorker):
+    opening_sent = Signal(object)
+    openings_complete = Signal(int)
+
+    def __init__(self,adb: ADBClient,serial: str,users: list[dict],message: str,
+                 runtime: dict,conversation_repository: ConversationRepository | None,
+                 job_id: int,user_repository: UserRepository,
+                 job_repository: AutomationJobRepository) -> None:
+        super().__init__(adb,serial,runtime,conversation_repository,job_id)
+        self.users=users; self.message=message; self.stop_event=Event()
+        self.user_repository=user_repository; self.job_repository=job_repository
+
+    def stop(self) -> None:
+        self.stop_event.set(); super().stop()
+
+    def run(self) -> None:
+        screen_session=None
+        try:
+            screen_session=self.adb.begin_screen_awake(self.serial)
+            total=len(self.users)
+            for index,user in enumerate(self.users,1):
+                if self.stop_event.is_set():raise WorkflowCancelled("自动化任务已停止")
+                handle=str(user["handle"])
+                self.progress_changed.emit(
+                    "OPENING_TARGET",f"[{index}/{total}] 正在向 {handle} 发送启动话术",100
+                )
+                self.workflow=TikTokMessageWorkflow(self.adb,self.serial)
+                normalized=self.workflow.run_message(
+                    handle,self.message,
+                    lambda step,text,percent:self.progress_changed.emit(
+                        step,f"[{index}/{total}] {handle} | {text}",percent
+                    ),
+                )
+                payload={"user_id":int(user["id"]),"handle":normalized,
+                         "display_name":str(user.get("username") or normalized),
+                         "index":index,"total":total,"message":self.message}
+                self.user_repository.mark_first_message_sent(payload["user_id"])
+                self.job_repository.update_completed_count(self.job_id,index)
+                self.progress_changed.emit(
+                    "OPENING_SENT",f"[{index}/{total}] 已向 {normalized} 成功发送启动话术",100
+                )
+                self.opening_sent.emit(payload)
+                self.message_recorded.emit({"handle":normalized,"display_name":payload["display_name"],
+                    "direction":"outbound","message_kind":"opening","content":self.message})
+            self.openings_complete.emit(total)
+            if self.stop_event.is_set():raise WorkflowCancelled("自动化任务已停止")
+            self.progress_changed.emit(
+                "LISTEN_START",f"{total} 位用户启动话术发送完成，开始持续监听收件箱",100
+            )
+            self.workflow=TikTokInboxListener(self.adb,self.serial)
+            self._listen_forever()
+        except WorkflowCancelled as error:
+            self.cancelled.emit(str(error))
+        except Exception as error:
+            message=str(error)
+            if "屏幕状态：" not in message:
+                message+=f"；屏幕状态：{self.adb.describe_screen_state(self.serial)}"
+            self.failed.emit(message)
+        finally:
+            if screen_session is not None:self.adb.end_screen_awake(self.serial,screen_session)
 
 
 class AutomationTasksWidget(QWidget):
@@ -763,19 +821,58 @@ class AutomationTasksWidget(QWidget):
         if job_id is None:
             QMessageBox.information(self, "启动任务", "请先选择一个自动化任务。")
             return
+        if self.adb_client is None:
+            QMessageBox.warning(self,"无法启动任务","ADB 客户端不可用。"); return
+        job=self.repository.get_job(job_id)
+        if not job:
+            QMessageBox.warning(self,"无法启动任务","自动化任务不存在。"); return
+        serial=str(job.get("device_serial") or "")
+        if serial not in self.ready_devices:
+            QMessageBox.warning(self,"无法启动任务","任务所选设备当前未连接或未就绪。"); return
+        try:runtime=self._strategy_runtime(job)
+        except Exception as error:
+            QMessageBox.warning(self,"无法启动任务",str(error)); return
+        users=self.user_repository.list_unsent_by_tag(
+            str(job.get("user_tag") or ""),int(job.get("execution_count") or 1)
+        )
+        if not users:
+            QMessageBox.information(
+                self,"启动任务","没有找到符合标签且尚未发送首次消息的用户。"
+            ); return
         try:
             self.repository.start_job(job_id)
-            self.repository.execute_dialog_preview(job_id, keep_running=True)
         except Exception as error:
             job = self.repository.get_job(job_id)
             if job and job["status"] == "running":
                 self.repository.fail_job(job_id, str(error))
             QMessageBox.warning(self, "无法启动任务", str(error))
             return
-        job = self.repository.get_job(job_id)
-        if job and self.adb_client is not None:
-            self._start_inbox_listener(job_id, str(job["device_serial"] or ""))
+        requested=int(job.get("execution_count") or 1)
+        if len(users)<requested:
+            self.repository.add_log(
+                job_id,f"符合条件的未发送用户仅 {len(users)} 位，少于计划的 {requested} 位"
+            )
+        self.repository.add_log(
+            job_id,f"开始真实设备发送：设备 {serial}，目标用户 {len(users)} 位"
+        )
+        try:
+            self._launch_dialog_worker(
+                job_id,serial,users,str(job.get("opening_message") or ""),runtime
+            )
+        except Exception as error:
+            self.repository.fail_job(job_id,str(error))
+            QMessageBox.warning(self,"无法启动任务",str(error)); return
         self.refresh_jobs(job_id)
+
+    def _launch_dialog_worker(
+        self,job_id: int,serial: str,users: list[dict],message: str,runtime: dict
+    ) -> None:
+        self.listen_worker=DialogAutomationWorker(
+            self.adb_client,serial,users,message,runtime,self.conversation_repository,
+            job_id,self.user_repository,self.repository,
+        )
+        self.listen_worker.opening_sent.connect(lambda _payload:self.refresh_jobs(job_id))
+        self._connect_inbox_worker(job_id,listen_only=False)
 
     def _start_inbox_listener(self, job_id: int, serial: str) -> None:
         if not serial or self.adb_client is None:
@@ -799,6 +896,9 @@ class AutomationTasksWidget(QWidget):
         self.listen_worker = InboxListenWorker(
             self.adb_client, serial, runtime, self.conversation_repository, job_id
         )
+        self._connect_inbox_worker(job_id,listen_only)
+
+    def _connect_inbox_worker(self,job_id: int,listen_only: bool) -> None:
         self.listen_worker.progress_changed.connect(
             lambda step, text, percent: self._listen_progress(
                 job_id, step, text, percent
@@ -830,7 +930,9 @@ class AutomationTasksWidget(QWidget):
             self._selection_changed()
 
     def _listen_failed(self, job_id: int, error: str) -> None:
-        self.repository.add_log(job_id, f"[消息监听失败] {error}", "ERROR")
+        stage=("自动化任务" if isinstance(self.listen_worker,DialogAutomationWorker)
+               else "消息监听")
+        self.repository.add_log(job_id, f"[{stage}失败] {error}", "ERROR")
         job = self.repository.get_job(job_id)
         if not self.listen_only_mode and job and job["status"] == "running":
             self.repository.fail_job(job_id, error)
