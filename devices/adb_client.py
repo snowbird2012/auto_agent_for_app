@@ -399,6 +399,12 @@ class ADBClient:
     def press_home(self, serial: str) -> None:
         self.shell(serial, ["input", "keyevent", "KEYCODE_HOME"])
 
+    def foreground_package(self,serial: str) -> str:
+        output=self.shell(
+            serial,["dumpsys","activity","activities"],timeout=12
+        )
+        return self.parse_foreground_package(output)
+
     def start_app(self, serial: str, package: str = DEFAULT_TIKTOK_PACKAGE) -> None:
         if package == DEFAULT_TIKTOK_PACKAGE:
             package = self.resolve_tiktok_package(serial, package)

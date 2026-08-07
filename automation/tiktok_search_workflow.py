@@ -21,6 +21,7 @@ from devices import ADBClient
 # 冷启动到搜索入口可用的最长等待。实测低端机（OPPO A16 / Android 11）需要 21~28 秒，
 # 机型和网络越差越久，这里留出足够余量。
 SEARCH_READY_TIMEOUT = 60.0
+APP_START_TIMEOUT = 35.0
 # 这段时间内只轮询、不按返回键：闪屏阶段按返回会把 App 逐层退出。
 SEARCH_BACK_GRACE = 25.0
 
@@ -137,7 +138,7 @@ class TikTokSearchWorkflow:
             self.adb.start_app(self.serial, self.package)
             self.device = u2.connect(self.serial)
             self._capture_screen_size()
-            self._wait_package(12)
+            self._wait_package(APP_START_TIMEOUT)
 
             self._emit(progress, "OPEN_SEARCH", "正在定位搜索入口", 18)
             self._open_search()
@@ -231,13 +232,24 @@ class TikTokSearchWorkflow:
 
     def _wait_package(self, timeout: float) -> None:
         deadline = monotonic() + timeout
+        last_u2=""; last_adb=""; next_adb_check=0.0
         while monotonic() < deadline:
             self._check_cancelled()
             current = self.device.app_current()
-            if current.get("package") == self.package:
+            last_u2=str(current.get("package") or "")
+            if last_u2 == self.package:
                 return
+            now=monotonic()
+            if now>=next_adb_check:
+                try:last_adb=self.adb.foreground_package(self.serial)
+                except Exception:last_adb=""
+                if last_adb==self.package:return
+                next_adb_check=now+1.2
             sleep(0.4)
-        raise WorkflowError("TikTok 启动超时")
+        raise WorkflowError(
+            f"TikTok 启动超时（期望包名：{self.package}；"
+            f"uiautomator2前台：{last_u2 or '未知'}；ADB前台：{last_adb or '未知'}）"
+        )
 
     def _open_search(self, timeout: float = SEARCH_READY_TIMEOUT) -> None:
         # TikTok can reopen on the Tako chat page. Only the real search field

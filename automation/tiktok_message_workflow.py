@@ -8,6 +8,7 @@ import unicodedata
 import uiautomator2 as u2
 
 from automation.tiktok_search_workflow import (
+    APP_START_TIMEOUT,
     ProgressCallback,
     TikTokSearchWorkflow,
     UINode,
@@ -44,7 +45,7 @@ class TikTokMessageWorkflow(TikTokSearchWorkflow):
             self.adb.start_app(self.serial, self.package)
             self.device = u2.connect(self.serial)
             self._capture_screen_size()
-            self._wait_package(12)
+            self._wait_package(APP_START_TIMEOUT)
 
             self._emit(progress, "OPEN_SEARCH", "正在打开 TikTok 搜索", 18)
             self._open_search()
